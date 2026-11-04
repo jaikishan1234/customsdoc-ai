@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.2.0",
+    "better-auth": "^1.7.16",
     "drizzle-orm": "^0.45.4",
     "next": "16.4.5",
     "react": "19.3.0",
@@ -20,6 +21,7 @@
     "server-only": "^0.0.1"
   },
   "devDependencies": {
+    "@better-auth/cli": "^1.4.22",
     "@tailwindcss/postcss": "^4.3.4",
     "@types/node": "^20",
     "@types/react": "^19",
