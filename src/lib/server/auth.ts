@@ -26,7 +26,7 @@ export async function getSession(): Promise<Session | null> {
 }
 
 /** Only allow app-internal paths as post-auth redirect targets. */
-const isSafeRedirectPath = (path: string): boolean =>
+export const isSafeRedirectPath = (path: string): boolean =>
   path.startsWith("/") && !path.startsWith("//");
 
 /**
