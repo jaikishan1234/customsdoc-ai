@@ -22,7 +22,12 @@ import "server-only";
 import { count, desc, eq } from "drizzle-orm";
 
 import { db } from "@/lib/db";
-import { shipmentStatus, shipments, type Shipment } from "@/lib/db/schema";
+import {
+  auditLogs,
+  shipmentStatus,
+  shipments,
+  type Shipment,
+} from "@/lib/db/schema";
 import { requireSession } from "@/lib/server/auth";
 import {
   appendAuditLog,
@@ -271,6 +276,90 @@ export async function countShipments(): Promise<ShipmentCountResult> {
     return { status: "success", total: results[0]?.total ?? 0 };
   } catch {
     console.error("[shipment-service] Failed to count shipments.");
+    return { status: "unavailable" };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Read-only shipment detail + audit trail
+// ---------------------------------------------------------------------------
+
+/** Generic UUID shape (casing-insensitive). Version digits are not required
+ * since ids are produced by `gen_random_uuid()` (v4) but the pattern only
+ * guards the format before a query is spent. */
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Maximum audit rows fetched for the detail page (newest first). */
+const AUDIT_HISTORY_LIMIT = 50;
+
+/** Audit row reduced to exactly what the detail page renders. */
+export interface ShipmentAuditEntry {
+  id: string;
+  action: string;
+  /** null = system actors (no user). */
+  actorId: string | null;
+  /** Actual audit timestamp column (`performed_at`, schema auditLogs.ts). */
+  performedAt: Date;
+  /** JSONB payload (e.g. { reference, createdBy }); rendered defensively. */
+  details: unknown;
+}
+
+export interface ShipmentDetailSuccess {
+  status: "found";
+  shipment: Shipment;
+  auditTrail: ShipmentAuditEntry[];
+}
+
+export type ShipmentDetailResult =
+  | ShipmentDetailSuccess
+  | { status: "not_found" }
+  | { status: "unavailable" };
+
+/**
+ * Load one shipment plus its audit history, newest first, by strict UUID
+ * validation before querying (malformed ids short-circuit to `not_found`
+ * without spending a DB round-trip). Shipment row and audit rows are two
+ * independent reads via Promise.all (neon-http; no transaction needed for
+ * reads). Missing shipments (or invalid ids) return `not_found`; DB failures
+ * are logged server-side (id only, no SQL/connection data) and reported as
+ * `unavailable` — never raw driver details. No mutations.
+ */
+export async function getShipmentById(
+  id: unknown,
+): Promise<ShipmentDetailResult> {
+  const shipmentId = typeof id === "string" ? id.trim() : "";
+  if (!UUID_PATTERN.test(shipmentId)) {
+    return { status: "not_found" };
+  }
+
+  try {
+    const [shipmentRows, auditRows] = await Promise.all([
+      db.select().from(shipments).where(eq(shipments.id, shipmentId)).limit(1),
+      db
+        .select({
+          id: auditLogs.id,
+          action: auditLogs.action,
+          actorId: auditLogs.actorId,
+          performedAt: auditLogs.performedAt,
+          details: auditLogs.details,
+        })
+        .from(auditLogs)
+        .where(eq(auditLogs.shipmentId, shipmentId))
+        .orderBy(desc(auditLogs.performedAt), desc(auditLogs.id))
+        .limit(AUDIT_HISTORY_LIMIT),
+    ]);
+
+    const shipment = shipmentRows[0];
+    if (!shipment) {
+      return { status: "not_found" };
+    }
+
+    return { status: "found", shipment, auditTrail: auditRows };
+  } catch {
+    console.error(
+      `[shipment-service] Failed to load shipment detail (id=${shipmentId}).`,
+    );
     return { status: "unavailable" };
   }
 }
