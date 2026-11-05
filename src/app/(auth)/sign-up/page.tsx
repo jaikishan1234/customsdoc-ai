@@ -11,6 +11,13 @@ export const metadata: Metadata = {
   description: "Register for the CustomsDoc AI documentation workspace.",
 };
 
+// This route deliberately serves a dynamic (blocking) shell: the redirect
+// decision depends on the request cookies/headers via getSession(), which
+// cannot be prerendered into a static shell. `instant = false` opts this
+// segment out of instant-navigation validation without disabling Cache
+// Components or caching the session data.
+export const instant = false;
+
 export default async function SignUpPage() {
   // Server-side session check: an authenticated user has no business on the
   // registration page — send them straight to the application.

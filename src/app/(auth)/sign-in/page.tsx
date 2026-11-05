@@ -11,6 +11,13 @@ export const metadata: Metadata = {
   description: "Sign in to the CustomsDoc AI documentation workspace.",
 };
 
+// This route deliberately serves a dynamic (blocking) shell: the redirect
+// decision and the `?next=` handling depend on request cookies/headers via
+// getSession(), which cannot be prerendered into a static shell.
+// `instant = false` opts this segment out of instant-navigation validation
+// without disabling Cache Components or caching the session data.
+export const instant = false;
+
 type SearchParams = Promise<Record<string, string | string[] | undefined>>;
 
 export default async function SignInPage({
