@@ -16,6 +16,8 @@
  * server-side helpers (requireRole / requireManager) and route-handler guards.
  */
 
+import Link from "next/link";
+
 import { LogoutButton } from "./logout-button";
 import { formatRoleLabel } from "@/lib/role-display";
 
@@ -42,12 +44,20 @@ export function UserNavigation({
       aria-label="Application"
       className="flex w-full flex-wrap items-center justify-between gap-3 border-b border-zinc-200 bg-white px-4 py-3 dark:border-zinc-800 dark:bg-zinc-950 sm:px-6"
     >
-      <div className="flex items-center gap-2">
+      <div className="flex items-center gap-1">
         {product && (
           <span className="text-sm font-semibold tracking-tight text-zinc-900 dark:text-zinc-50">
             {product}
           </span>
         )}
+        {/* Display-only entry point to the (already server-protected)
+            shipments pages — never an authorization boundary itself. */}
+        <Link
+          href="/shipments"
+          className="rounded-full px-2 py-1 text-sm text-zinc-600 transition hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800 dark:hover:text-zinc-50"
+        >
+          Shipments
+        </Link>
       </div>
       <div className="flex min-w-0 items-center gap-3">
         <span className="truncate text-sm text-zinc-600 dark:text-zinc-300">

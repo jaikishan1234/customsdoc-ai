@@ -1,7 +1,8 @@
 import "server-only";
 
 /**
- * Shipment service — the ONLY sanctioned writer of the shipments table.
+ * Shipment service — the ONLY sanctioned writer of the shipments table, and
+ * the sanctioned reader for listing/count queries.
  *
  * All state and ownership decisions are made here, server-side:
  * - `createdBy` comes exclusively from the verified session (`requireSession`).
@@ -18,8 +19,10 @@ import "server-only";
  * duplicate-reference error), so no duplicate shipment can be created.
  */
 
+import { count, desc, eq } from "drizzle-orm";
+
 import { db } from "@/lib/db";
-import { shipments, type Shipment } from "@/lib/db/schema";
+import { shipmentStatus, shipments, type Shipment } from "@/lib/db/schema";
 import { requireSession } from "@/lib/server/auth";
 import {
   appendAuditLog,
@@ -154,4 +157,120 @@ export async function createShipment(
   }
 
   return { status: "created", shipment: created };
+}
+
+// ---------------------------------------------------------------------------
+// Read-only queries (listing / dashboard counts)
+// ---------------------------------------------------------------------------
+
+/** Page size for shipment listings. */
+export const SHIPMENTS_PAGE_SIZE = 20;
+
+/** Upper bound of requested pages — prevents absurd offsets from bad URLs. */
+const MAX_LIST_PAGE = 1000;
+
+/** All shipment statuses (derived from the pgEnum — single source of truth). */
+export const SHIPMENT_STATUSES = shipmentStatus.enumValues;
+
+export type ShipmentStatusValue = (typeof shipmentStatus.enumValues)[number];
+
+export interface ShipmentListSuccess {
+  status: "success";
+  shipments: Shipment[];
+  /** Total shipments matching the filter (across all pages). */
+  total: number;
+  /** Current 1-based page (clamped to a safe range). */
+  page: number;
+  pageSize: number;
+  totalPages: number;
+  /** Active status filter after validation, or null for "all". */
+  statusFilter: ShipmentStatusValue | null;
+}
+
+export type ShipmentListResult =
+  | ShipmentListSuccess
+  | { status: "unavailable" };
+
+/**
+ * List shipments, newest first, with optional validated status filter and
+ * clamped pagination. Raw/untrusted `page`/`status` inputs (e.g. URL query
+ * params) are sanitized here: page falls back to 1 outside [1, MAX],
+ * statuses not in the pgEnum are ignored (no filter), and there is no way to
+ * inject through either path. Two independent queries run concurrently via
+ * Promise.all (neon-http has no transactions; reads don't need one).
+ *
+ * Errors are logged server-side and reported as `unavailable` — never raw
+ * SQL/driver details. Does not modify `createShipment` behavior.
+ */
+export async function listShipments(params: {
+  page?: unknown;
+  status?: unknown;
+}): Promise<ShipmentListResult> {
+  // Page: accept numeric strings; anything invalid -> page 1, clamped.
+  const parsedPage = Number.parseInt(String(params.page ?? ""), 10);
+  const page =
+    Number.isFinite(parsedPage) && parsedPage >= 1
+      ? Math.min(parsedPage, MAX_LIST_PAGE)
+      : 1;
+
+  // Status filter: case-insensitive match against the pgEnum values only.
+  const rawStatus =
+    typeof params.status === "string" ? params.status.trim().toUpperCase() : "";
+  const statusFilter = (SHIPMENT_STATUSES as readonly string[]).includes(
+    rawStatus,
+  )
+    ? (rawStatus as ShipmentStatusValue)
+    : null;
+
+  const whereClause = statusFilter ? eq(shipments.status, statusFilter) : undefined;
+
+  try {
+    // `desc(createdAt)` newest-first with `desc(id)` as a deterministic
+    // tie-break so rows inserted in the same instant cannot reorder pages.
+    const [pageRows, countRows] = await Promise.all([
+      db
+        .select()
+        .from(shipments)
+        .where(whereClause)
+        .orderBy(desc(shipments.createdAt), desc(shipments.id))
+        .limit(SHIPMENTS_PAGE_SIZE)
+        .offset((page - 1) * SHIPMENTS_PAGE_SIZE),
+      db.select({ total: count() }).from(shipments).where(whereClause),
+    ]);
+
+    const total = countRows[0]?.total ?? 0;
+
+    return {
+      status: "success",
+      shipments: pageRows,
+      total,
+      page,
+      pageSize: SHIPMENTS_PAGE_SIZE,
+      totalPages: Math.ceil(total / SHIPMENTS_PAGE_SIZE),
+      statusFilter,
+    };
+  } catch {
+    console.error(
+      `[shipment-service] Failed to list shipments (page=${page}, statusFilter=${statusFilter ?? "all"}).`,
+    );
+    return { status: "unavailable" };
+  }
+}
+
+export type ShipmentCountResult =
+  | { status: "success"; total: number }
+  | { status: "unavailable" };
+
+/**
+ * Total shipment count for dashboard statistics. Real data only — callers
+ * render `unavailable` as "—" instead of inventing a number.
+ */
+export async function countShipments(): Promise<ShipmentCountResult> {
+  try {
+    const results = await db.select({ total: count() }).from(shipments);
+    return { status: "success", total: results[0]?.total ?? 0 };
+  } catch {
+    console.error("[shipment-service] Failed to count shipments.");
+    return { status: "unavailable" };
+  }
 }
