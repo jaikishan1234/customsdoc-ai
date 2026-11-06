@@ -1,8 +1,9 @@
 import "server-only";
 
 /**
- * Document upload service — the ONLY sanctioned writer of the documents
- * table (uploads / active-version replacement).
+ * Document service — the ONLY sanctioned writer of the documents table
+ * (uploads / active-version replacement), and the sanctioned reader for
+ * document listings on the shipment detail page.
  *
  * Approved decision flow (milestone: document upload API):
  * - A: a document type left with zero active rows (previous session's crash
@@ -45,7 +46,13 @@ import { createHash, randomUUID } from "node:crypto";
 import { and, eq, max, sql } from "drizzle-orm";
 
 import { db } from "@/lib/db";
-import { documents, shipments, type ShipmentDocument } from "@/lib/db/schema";
+import {
+  documents,
+  documentType,
+  shipments,
+  user,
+  type ShipmentDocument,
+} from "@/lib/db/schema";
 import { getSession, hasRole } from "@/lib/server/auth";
 import { USER_ROLES } from "@/lib/auth";
 import {
@@ -380,3 +387,129 @@ const logOrphanedAsset = (
       `reconciliation.`,
   );
 };
+
+// ---------------------------------------------------------------------------
+// Read-only listing (shipment detail page)
+// ---------------------------------------------------------------------------
+
+/** All document types, in pgEnum declaration order (the validation module's
+ * DOCUMENT_TYPES allow-list mirrors this — keep them aligned). */
+const DOCUMENT_TYPE_ORDER = documentType.enumValues;
+
+export type DocumentEntryType = (typeof documentType.enumValues)[number];
+
+/**
+ * One document version as shown on the detail page — metadata ONLY.
+ * Deliberately excludes `storageKey`, `checksumSha256` and anything provider
+ * related; those are server-side facts and never leave the server.
+ */
+export interface ShipmentDocumentEntry {
+  id: string;
+  documentType: DocumentEntryType;
+  /** Sniffed MIME type stored at upload (always application/pdf today). */
+  mimeType: string;
+  /** Sanitized client-provided filename (provenance only). */
+  originalFilename: string;
+  sizeBytes: number;
+  version: number;
+  /** Active = the current version of its type; false = superseded history. */
+  isActive: boolean;
+  /** Set when superseded (never null on inactive rows — DB CHECK). */
+  supersededAt: Date | null;
+  /** Upload time (`documents.created_at`). */
+  uploadedAt: Date;
+  /** Uploader identity resolved from the auth user table (FK restrict). */
+  uploadedBy: { id: string; name: string };
+}
+
+export type DocumentListResult =
+  | { status: "success"; entries: ShipmentDocumentEntry[] }
+  | { status: "not_found" }
+  | { status: "unavailable" };
+
+/**
+ * List every document version of a shipment, ordered by document type (pgEnum
+ * declaration order) then descending version, so each type forms a newest-
+ * first history block with its active version at the top.
+ *
+ * - Strict UUID validation first; malformed ids short-circuit to `not_found`
+ *   without spending a DB round-trip (same pattern as `getShipmentById`).
+ * - Shipment existence is verified in the same Promise.all: a missing or
+ *   deleted shipment returns `not_found` rather than a silent empty list.
+ * - The join to `user` cannot fan out (uploaded_by is a restrict FK to a
+ *   unique primary key), so one row per document is guaranteed.
+ * - No pagination: rows per shipment are bounded by the three required
+ *   document types and their version counts.
+ * - Reads are independent queries (neon-http; no transaction needed) and the
+ *   service NEVER mutates anything. DB failures are logged server-side
+ *   (shipment id only, no SQL/driver details) and reported as `unavailable`.
+ */
+export async function listDocumentsForShipment(
+  shipmentId: unknown,
+): Promise<DocumentListResult> {
+  const id = typeof shipmentId === "string" ? shipmentId.trim() : "";
+  if (!UUID_PATTERN.test(id)) {
+    return { status: "not_found" };
+  }
+
+  try {
+    const [shipmentRows, rows] = await Promise.all([
+      db
+        .select({ id: shipments.id })
+        .from(shipments)
+        .where(eq(shipments.id, id))
+        .limit(1),
+      db
+        .select({
+          id: documents.id,
+          documentType: documents.documentType,
+          originalFilename: documents.originalFilename,
+          mimeType: documents.mimeType,
+          sizeBytes: documents.sizeBytes,
+          version: documents.version,
+          isActive: documents.isActive,
+          supersededAt: documents.supersededAt,
+          uploadedAt: documents.createdAt,
+          uploaderId: user.id,
+          uploaderName: user.name,
+        })
+        .from(documents)
+        .innerJoin(user, eq(documents.uploadedBy, user.id))
+        .where(eq(documents.shipmentId, id)),
+    ]);
+
+    if (!shipmentRows[0]) {
+      return { status: "not_found" };
+    }
+
+    const entries = rows
+      .map<ShipmentDocumentEntry>((row) => ({
+        id: row.id,
+        documentType: row.documentType,
+        mimeType: row.mimeType,
+        originalFilename: row.originalFilename,
+        sizeBytes: row.sizeBytes,
+        version: row.version,
+        isActive: row.isActive,
+        supersededAt: row.supersededAt,
+        uploadedAt: row.uploadedAt,
+        uploadedBy: { id: row.uploaderId, name: row.uploaderName },
+      }))
+      .sort((first, second) => {
+        // Document types in schema-declared order, then version descending
+        // (deterministic: versions are unique per shipment + type).
+        const typeDelta =
+          DOCUMENT_TYPE_ORDER.indexOf(first.documentType) -
+          DOCUMENT_TYPE_ORDER.indexOf(second.documentType);
+        if (typeDelta !== 0) return typeDelta;
+        return second.version - first.version;
+      });
+
+    return { status: "success", entries };
+  } catch {
+    console.error(
+      `[document-service] Failed to list documents (shipmentId=${id}).`,
+    );
+    return { status: "unavailable" };
+  }
+}

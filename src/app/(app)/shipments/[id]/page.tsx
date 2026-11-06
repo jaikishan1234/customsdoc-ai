@@ -5,8 +5,14 @@ import type { ReactNode } from "react";
 
 import { ShipmentStatusBadge } from "@/components/shipment-status-badge";
 import { formatLongDateTimeUtc } from "@/lib/date-display";
+import {
+  formatDocumentTypeLabel,
+  formatFileSizeBytes,
+} from "@/lib/document-display";
+import { listDocumentsForShipment } from "@/lib/services/document-service";
 import { getShipmentById } from "@/lib/services/shipment-service";
 import { requireSession } from "@/lib/server/auth";
+import type { ShipmentDocumentEntry } from "@/lib/services/document-service";
 import type { Shipment } from "@/lib/db/schema";
 
 export const metadata: Metadata = {
@@ -29,11 +35,6 @@ const monoValueClasses =
 
 const placeholderSections = [
   {
-    key: "documents",
-    title: "Documents & uploads",
-    note: "Versioned invoice, packing list and bill of lading uploads with checksums.",
-  },
-  {
     key: "extraction",
     title: "AI extraction & cross-document validation",
     note: "Field extraction with confidence plus cross-document discrepancy checks.",
@@ -44,6 +45,56 @@ const placeholderSections = [
     note: "Manager approval decisions and export-ready CSV stamping.",
   },
 ] as const;
+
+/** Status pill styling for a document version's active/superseded state. */
+const DOCUMENT_VERSION_STATUS = {
+  active: {
+    label: "Active",
+    className:
+      "inline-block whitespace-nowrap rounded-full border px-2 py-0.5 text-xs font-medium border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-300",
+  },
+  superseded: {
+    label: "Superseded",
+    className:
+      "inline-block whitespace-nowrap rounded-full border px-2 py-0.5 text-xs font-medium border-zinc-300 bg-zinc-100 text-zinc-600 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400",
+  },
+} as const;
+
+const DocumentVersionStatusPill = ({ isActive }: { isActive: boolean }) => {
+  const known = isActive ? DOCUMENT_VERSION_STATUS.active : DOCUMENT_VERSION_STATUS.superseded;
+  return <span className={known.className}>{known.label}</span>;
+};
+
+/**
+ * One version row in the Documents section. Renders only the metadata the
+ * listing service exposes — no storage keys, checksums or provider facts.
+ */
+function DocumentRow({ entry }: { entry: ShipmentDocumentEntry }) {
+  return (
+    <li className="flex flex-col gap-1.5 py-3">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+        <span className="break-all text-sm font-medium text-zinc-800 dark:text-zinc-100">
+          {entry.originalFilename}
+        </span>
+        <span className="rounded-md bg-zinc-100 px-2 py-0.5 text-xs font-medium text-zinc-700 dark:bg-zinc-900 dark:text-zinc-200">
+          {formatDocumentTypeLabel(entry.documentType)}
+        </span>
+        <span className="font-mono text-xs text-zinc-500 dark:text-zinc-400">
+          v{entry.version}
+        </span>
+        <DocumentVersionStatusPill isActive={entry.isActive} />
+      </div>
+      <p className="text-xs text-zinc-500 dark:text-zinc-400">
+        {formatFileSizeBytes(entry.sizeBytes)} PDF · uploaded{" "}
+        {formatLongDateTimeUtc(entry.uploadedAt, "UTC")} by{" "}
+        {entry.uploadedBy.name}
+        {entry.supersededAt
+          ? ` · superseded ${formatLongDateTimeUtc(entry.supersededAt, "UTC")}`
+          : null}
+      </p>
+    </li>
+  );
+}
 
 /**
  * The read-only facts shown on the detail page, mapped directly from the
@@ -200,6 +251,12 @@ export default async function ShipmentDetailPage({ params }: { params: Params })
 
   const { shipment, auditTrail } = result;
 
+  // Read-only document history — independent of the shipment row above.
+  const documentsResult = await listDocumentsForShipment(id);
+  const documentEntries =
+    documentsResult.status === "success" ? documentsResult.entries : [];
+  const documentsUnavailable = documentsResult.status === "unavailable";
+
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-1 flex-col gap-6 px-4 py-8 sm:px-6">
       <header className="flex flex-col gap-3">
@@ -259,6 +316,43 @@ export default async function ShipmentDetailPage({ params }: { params: Params })
         </div>
       </section>
 
+      {/* Documents & uploads — versioned per-type history (documents table). */}
+      <section aria-label="Documents and uploads" className={panelClasses}>
+        <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-2">
+          <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">
+            Documents &amp; uploads
+          </h2>
+          {documentEntries.length > 0 ? (
+            <span className="text-xs text-zinc-500 dark:text-zinc-400">
+              {documentEntries.filter((entry) => entry.isActive).length} active
+              of {documentEntries.length} version
+              {documentEntries.length === 1 ? "" : "s"}
+            </span>
+          ) : null}
+        </div>
+        <p className="text-xs text-zinc-500 dark:text-zinc-400">
+          Version history per document type, newest version first. Superseded
+          versions are retained for traceability.
+        </p>
+        {documentsUnavailable ? (
+          <p className="rounded-xl border border-dashed border-zinc-300 p-6 text-center text-sm text-zinc-600 dark:border-zinc-700 dark:text-zinc-300">
+            Document data could not be loaded. Please try again.
+          </p>
+        ) : documentEntries.length === 0 ? (
+          <p className="rounded-xl border border-dashed border-zinc-300 p-6 text-center text-sm text-zinc-600 dark:border-zinc-700 dark:text-zinc-300">
+            No documents uploaded yet for this shipment. Invoices, packing
+            lists and bills of lading will appear here with their full version
+            history once uploaded.
+          </p>
+        ) : (
+          <ol className="flex flex-col divide-y divide-zinc-200 dark:divide-zinc-800">
+            {documentEntries.map((entry) => (
+              <DocumentRow key={entry.id} entry={entry} />
+            ))}
+          </ol>
+        )}
+      </section>
+
       {/* Audit history — append-only trail (audit_logs, newest first). */}
       <section aria-label="Audit history" className={panelClasses}>
         <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">
@@ -299,7 +393,7 @@ export default async function ShipmentDetailPage({ params }: { params: Params })
         <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">
           Coming to this page
         </h2>
-        <div className="grid gap-4 sm:grid-cols-3">
+        <div className="grid gap-4 sm:grid-cols-2">
           {placeholderSections.map((section) => (
             <div
               key={section.key}
