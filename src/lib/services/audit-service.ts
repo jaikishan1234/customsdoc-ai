@@ -27,6 +27,7 @@ export type AuditEntityType = (typeof AUDIT_ENTITY_TYPES)[keyof typeof AUDIT_ENT
 /** Canonical audit action strings. Callers must use these constants. */
 export const AUDIT_ACTIONS = {
   shipmentCreate: "SHIPMENT_CREATE",
+  documentUpload: "DOCUMENT_UPLOAD",
 } as const;
 
 export type AuditActor = string | null; // null = system

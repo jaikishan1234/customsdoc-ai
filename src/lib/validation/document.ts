@@ -29,10 +29,12 @@ export const DOCUMENT_TYPES = [
 
 export type DocumentTypeValue = (typeof DOCUMENT_TYPES)[number];
 
-export interface DocumentTypeError {
-  field: "documentType";
+export interface DocumentValidationError {
+  field: "size" | "mimeType" | "filename" | "documentType";
   message: string;
 }
+
+export type DocumentTypeError = DocumentValidationError;
 
 /** Validate a client-supplied document type (e.g. FormData value). */
 export function validateDocumentTypeInput(
@@ -57,11 +59,6 @@ export interface ValidatedDocument {
   /** Zero-copy reference to the exact received bytes. */
   data: Uint8Array;
 }
-
-export type DocumentValidationError = {
-  field: "size" | "mimeType" | "filename";
-  message: string;
-};
 
 export type PdfValidationResult =
   | { success: true; document: ValidatedDocument }
