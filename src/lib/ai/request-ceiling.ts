@@ -5,10 +5,10 @@
  * NOT a global quota: each server process (and every serverless instance)
  * keeps its own module-scope counter, so on multi-instance deployments the
  * effective project-wide cap is `ceiling x instance count`. A durable
- * project-wide limit is proposed for the extraction-service step by counting
- * existing `extractions` rows whose `created_at` falls within the current UTC
- * day (the table already exists — no schema change required); this module
- * remains the cheap synchronous pre-check that fires before any wire call.
+ * project-wide limit complements this module — implemented in
+ * `src/lib/services/extraction-service.ts` as a per-attempt count of
+ * `extractions` rows whose `created_at` falls within the current UTC day
+ * (check-then-insert, inherently racy under concurrency — documented there).
  *
  * The ceiling is deliberately INDEPENDENT of Google's free-tier RPM/RPD
  * quotas (their exact free values are unpublished and can change; their RPD
@@ -21,8 +21,12 @@
  * provider's).
  */
 
-/** Conservative self-imposed daily limit; revisit as the free tier evolves. */
-const EXTRACTION_DAILY_REQUEST_CEILING = 40;
+/**
+ * Conservative self-imposed daily limit; revisit as the free tier evolves.
+ * Exported so the extraction service's durable row-count pre-check and this
+ * instance-local fail-safe stay one deliberate number.
+ */
+export const EXTRACTION_DAILY_REQUEST_CEILING = 40;
 
 const utcDayKey = (): string => new Date().toISOString().slice(0, 10);
 

@@ -28,6 +28,7 @@ export type AuditEntityType = (typeof AUDIT_ENTITY_TYPES)[keyof typeof AUDIT_ENT
 export const AUDIT_ACTIONS = {
   shipmentCreate: "SHIPMENT_CREATE",
   documentUpload: "DOCUMENT_UPLOAD",
+  extractionRun: "EXTRACTION_RUN",
 } as const;
 
 export type AuditActor = string | null; // null = system
