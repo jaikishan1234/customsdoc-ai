@@ -7,43 +7,49 @@ import "server-only";
  *
  * Approved decision flow (milestone: document upload API):
  * - A: a document type left with zero active rows (previous session's crash
- *   window) is recovered inline by the next upload — the replacement
- *   statement needs no prior active row (0-row tombstone CTE) and preserves
- *   full version history (version = max(version) + 1).
+ *   window) is recovered inline by the next upload — the tombstone statement
+ *   may match 0 rows and the insert needs no prior active row; full version
+ *   history is preserved (version = max(version) + 1).
  * - B: an active duplicate (same shipment + type + SHA-256) is rejected.
  * - C: superseded Cloudinary assets are retained — no deletion.
  * - D: no storage-delete API exists; orphaned assets (storage put succeeded,
- *   DB replace failed) are logged with key + checksum for reconciliation.
+ *   DB write failed) are logged with key + checksum for reconciliation.
  * - E: uploads to EXPORTED shipments are blocked (REJECTED is allowed).
  * - F: DOCUMENT_UPLOAD audit details carry reference, documentType, version,
  *   checksumSha256, storageKey and replacedVersionId (when replacing).
  *
- * Concurrency — atomic replacement in ONE PostgreSQL statement:
- *   WITH superseded AS (UPDATE ... WHERE is_active RETURNING id)
- *   INSERT ... VALUES (..., <new_version>) RETURNING id;
- * Safety analysis (PostgreSQL READ COMMITTED, neon-http single-statement
- * execution — one implicit transaction per request):
- * - The tombstone UPDATE and the active INSERT commit together or not at all;
- *   a crash between them is not possible mid-statement.
- * - The partial unique index `documents_active_type_uq` is checked against
- *   the LIVE index at insert time (not the statement snapshot), so a
- *   concurrent duplicate of the same shipment/type always ends with exactly
- *   one active row: the later committer's INSERT blocks on the winner's
- *   uncommitted index entry, then fails with SQLSTATE 23505 (either on
- *   `documents_active_type_uq` or `documents_version_uq` when both requests
- *   race to the same version) — its whole statement aborts, including the
- *   tombstone (EPQ re-check makes the concurrent UPDATE skip the already-
- *   superseded row; the CTE's effect is rolled back with the failed insert).
- *   A failed upload therefore leaves ZERO partial state and can be retried
- *   after recomputing the version.
- * - Because of this the "insert-then-tombstone" two-step variant is unusable
- *   (it would violate the partial unique index), and the plain two-statement
- *   tombstone/insert sequence is only used conceptually — replaced entirely
- *   by the atomic CTE. No schema change and no driver change are required.
+ * Concurrency — deterministic replacement in TWO sequential statements
+ * (neon-http: each statement is its own implicit transaction; there are no
+ * multi-statement transactions and no cross-statement read-modify-write
+ * atomicity):
+ *   S1: UPDATE documents SET is_active=false, superseded_at=now()
+ *         WHERE shipment_id AND document_type AND is_active
+ *         RETURNING id                     -> replacedVersionId (the ONLY source)
+ *   S2: INSERT INTO documents ... RETURNING (the full typed row via drizzle)
+ * PostgreSQL §7.8.4: the execution order of sibling data-modifying CTEs is
+ * UNPREDICTABLE, so the earlier single tombstone+insert CTE could violate
+ * `documents_active_type_uq` purely by scheduling. Two statements make
+ * tombstone-before-insert deterministic by construction.
+ * - S2's unique checks (`documents_active_type_uq`, `documents_version_uq`)
+ *   run against the LIVE index: a concurrent duplicate of the same
+ *   shipment/type blocks on the winner's uncommitted entry and fails with
+ *   SQLSTATE 23505.
+ * - Partial-failure window (honest disclosure): once S1 has committed, its
+ *   effect is NOT undone by an S2 failure. If S1 tombstoned ≥1 row and S2
+ *   then fails, the type is left with NO active document until the next
+ *   successful upload (whose S1 tolerates 0 active rows — decision A).
+ *   History, versions and audit are immutable/append-only, so nothing is
+ *   corrupted — but the replacement has NOT happened and must not be
+ *   reported as if it had: the distinct `replacement_incomplete` outcome is
+ *   returned and the stored asset is logged for reconciliation (decision D).
+ * - When S1 tombstoned 0 rows, an S2 failure leaves the pre-existing state
+ *   untouched: a unique violation maps to `upload_conflict` (retry-safe —
+ *   the next attempt recomputes version), anything else to
+ *   `unexpected_error`. No schema or driver change is required.
  */
 
 import { createHash, randomUUID } from "node:crypto";
-import { and, eq, max, sql } from "drizzle-orm";
+import { and, eq, max } from "drizzle-orm";
 
 import { db } from "@/lib/db";
 import {
@@ -100,10 +106,12 @@ export type UploadDocumentResult =
   | { status: "upload_conflict" }
   | { status: "storage_error" }
   | {
-      /** Insert succeeded but the typed read-back failed (rare). */
-      status: "readback_failed";
-      documentId: string;
-      replacedVersionId: string | null;
+      /** S1 deactivated the previous version but the replacement INSERT (S2)
+       * failed — the type has NO active document until the next successful
+       * upload. NOT a successful upload; the asset is logged for
+       * reconciliation (decision D) and recovery is a fresh upload. */
+      status: "replacement_incomplete";
+      replacedVersionId: string;
     }
   | { status: "unexpected_error" };
 
@@ -232,93 +240,56 @@ export async function uploadDocument(input: {
     return { status: "storage_error" };
   }
 
-  // --- 6. Atomic replacement: tombstone + insert in ONE statement ------------
+  // --- 6. Deterministic replacement in TWO sequential statements ------------
+  let replacedVersionId: string | null = null;
   try {
-    // One PostgreSQL statement (one implicit transaction):
-    // 1. `superseded` — tombstones the current active row (or no rows when
-    //    the type has none — decision A recovery), RETURNING its id.
-    // 2. `inserted` — inserts the new active version, RETURNING its id.
-    // 3. Final SELECT over `inserted` exposes exactly one row carrying the
-    //    inserted id plus `(SELECT id FROM superseded LIMIT 1)` — NULL when
-    //    nothing was superseded — so `replacedVersionId` is exact, taken
-    //    from the statement itself (no post-read inference).
-    // Concurrency semantics unchanged (see module header): unique checks run
-    // against the live index; any conflict aborts the WHOLE statement,
-    // including the tombstone, and is mapped to `upload_conflict`.
-    const replaced = await db.execute<{
-      inserted_id: string;
-      replaced_version_id: string | null;
-    }>(sql`
-      WITH superseded AS (
-        UPDATE documents
-        SET is_active = false,
-            superseded_at = now()
-        WHERE shipment_id = ${shipmentId}
-          AND document_type = ${documentType}
-          AND is_active = true
-        RETURNING id
-      ),
-      inserted AS (
-        INSERT INTO documents (
-          id,
-          shipment_id,
-          document_type,
-          original_filename,
-          mime_type,
-          size_bytes,
-          storage_key,
-          checksum_sha256,
-          version,
-          is_active,
-          superseded_at,
-          uploaded_by
-        ) VALUES (
-          ${documentId},
-          ${shipmentId},
-          ${documentType},
-          ${filename},
-          ${mimeType},
-          ${sizeBytes},
-          ${assetKey},
-          ${checksumSha256},
-          ${version},
-          true,
-          NULL,
-          ${uploaderId}
-        )
-        RETURNING id
+    // S1 — deactivate the current active version (or match 0 rows when the
+    // type has none — decision A recovery). Committed in its own implicit
+    // transaction; `replacedVersionId` comes from its RETURNING and is the
+    // ONLY source for that id. Its effect is NOT rolled back by an S2
+    // failure (documented in the module header).
+    const superseded = await db
+      .update(documents)
+      .set({ isActive: false, supersededAt: new Date() })
+      .where(
+        and(
+          eq(documents.shipmentId, shipmentId),
+          eq(documents.documentType, documentType),
+          eq(documents.isActive, true),
+        ),
       )
-      SELECT inserted.id AS inserted_id,
-             (SELECT s.id FROM superseded s LIMIT 1) AS replaced_version_id
-      FROM inserted
-      LIMIT 1
-    `);
+      .returning({ id: documents.id });
+    replacedVersionId = superseded[0]?.id ?? null;
 
-    // `replacedVersionId` comes straight from the statement: the id of the
-    // row tombstoned by the `superseded` CTE (NULL when the type had no
-    // active row — decision A recovery), with no post-read inference.
-    const replacedVersionId = replaced.rows[0]?.replaced_version_id ?? null;
-
-    // --- 7. Read back through the typed query builder ------------------------
-    const persistedRows = await db
-      .select()
-      .from(documents)
-      .where(eq(documents.id, documentId))
-      .limit(1);
-    const document = persistedRows[0];
+    // S2 — insert the new active version via the typed query builder;
+    // `.returning()` IS the typed read-back (no second read needed). The
+    // unique checks (`documents_active_type_uq`, `documents_version_uq`) run
+    // against the live index: a concurrent duplicate fails here with 23505.
+    const insertedRows = await db
+      .insert(documents)
+      .values({
+        id: documentId,
+        shipmentId,
+        documentType,
+        originalFilename: filename,
+        mimeType,
+        sizeBytes,
+        storageKey: assetKey,
+        checksumSha256,
+        version,
+        isActive: true,
+        supersededAt: null,
+        uploadedBy: uploaderId,
+      })
+      .returning();
+    const document = insertedRows[0];
     if (!document) {
-      // The insert committed (its own transaction — replacing active rows);
-      // only the read-back failed. Nothing is safe to undo from here — log
-      // precisely, leave a trail, and let the caller treat it as a retryable
-      // listing/read issue rather than a failed upload.
-      console.error(
-        `[document-service] Document ${documentId} was inserted but the ` +
-          `typed read-back failed (shipmentId=${shipmentId}, version=${version}).`,
-      );
-      return { status: "readback_failed", documentId, replacedVersionId };
+      // INSERT ... RETURNING returning zero rows should not happen for a
+      // plain insert; escalate so S2's failure policy below applies.
+      throw new Error("documents insert returned no row");
     }
 
-    // --- 8. Append-only audit (decision F) ----------------------------------
+    // --- 7. Append-only audit (decision F) ----------------------------------
     try {
       await appendAuditLog({
         action: AUDIT_ACTIONS.documentUpload,
@@ -347,28 +318,47 @@ export async function uploadDocument(input: {
     return { status: "uploaded", document, replacedVersionId };
   } catch (error) {
     const constraint = findUniqueViolationConstraint(error);
-    if (
-      constraint === DOCUMENT_ACTIVE_UNIQUE ||
-      constraint === DOCUMENT_VERSION_UNIQUE
-    ) {
-      // Concurrent duplicate upload — statement aborted atomically (tombstone
-      // included); a retry with a freshly computed version is safe.
+
+    if (replacedVersionId === null) {
+      // S1 tombstoned NOTHING (matched 0 rows, or S1 itself failed before
+      // committing) — S2's failure leaves the pre-existing state untouched.
+      if (
+        constraint === DOCUMENT_ACTIVE_UNIQUE ||
+        constraint === DOCUMENT_VERSION_UNIQUE
+      ) {
+        // Concurrent duplicate upload — S2 aborted atomically; a retry with
+        // a freshly computed version is safe.
+        console.error(
+          `[document-service] Concurrent upload conflict ` +
+            `(constraint=${constraint}, shipmentId=${shipmentId}, ` +
+            `documentType=${documentType}).`,
+        );
+        logOrphanedAsset(shipmentId, documentType, version, assetKey, checksumSha256);
+        return { status: "upload_conflict" };
+      }
+
       console.error(
-        `[document-service] Concurrent upload conflict ` +
-          `(constraint=${constraint}, shipmentId=${shipmentId}, ` +
-          `documentType=${documentType}).`,
+        `[document-service] Unexpected database failure replacing active ` +
+          `document (shipmentId=${shipmentId}, documentType=${documentType}, ` +
+          `version=${version}).`,
       );
       logOrphanedAsset(shipmentId, documentType, version, assetKey, checksumSha256);
-      return { status: "upload_conflict" };
+      return { status: "unexpected_error" };
     }
 
+    // S1 COMMITTED (≥1 row tombstoned) and S2 failed: the previous version is
+    // permanently deactivated while the replacement was NOT written. This is
+    // never surfaced as a successful upload — distinct recovery outcome, with
+    // the constraint name (if any) logged server-side only.
     console.error(
-      `[document-service] Unexpected database failure replacing active ` +
-        `document (shipmentId=${shipmentId}, documentType=${documentType}, ` +
-        `version=${version}).`,
+      `[document-service] Replacement incomplete: previous version ` +
+        `${replacedVersionId} was deactivated but the new insert failed ` +
+        `(constraint=${constraint ?? "none"}, shipmentId=${shipmentId}, ` +
+        `documentType=${documentType}, version=${version}) — the type has ` +
+        `no active document until the next successful upload.`,
     );
     logOrphanedAsset(shipmentId, documentType, version, assetKey, checksumSha256);
-    return { status: "unexpected_error" };
+    return { status: "replacement_incomplete", replacedVersionId };
   }
 }
 

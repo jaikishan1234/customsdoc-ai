@@ -10,39 +10,59 @@ import "server-only";
  *   1. session + roles (server-verified; roles mirror the upload decision —
  *      DOCUMENTATION_EXECUTIVE / DOCUMENTATION_MANAGER — pending a dedicated
  *      extraction-role decision)
- *   2. shipment EXPORTED gate; active documents via
+ *   2. shipment eligibility gate (explicit allow-list — see
+ *      {@link ELIGIBLE_STATUSES}); active documents via
  *      `getActiveDocumentsForExtraction` (the sanctioned extraction reader)
- *   3. shipment lifecycle: DRAFT -> PROCESSING (conditional single UPDATE;
- *      other statuses are left untouched — transitions into REVIEW and
- *      beyond belong to later milestones)
+ *   3. shipment lifecycle: DRAFT|REJECTED -> PROCESSING (single conditional
+ *      UPDATE guarded by an inArray allow-list; REVIEW and beyond are never
+ *      touched — transitions there belong to later milestones)
  *   4. per document: durable daily-count check -> attempt row (PROCESSING)
  *      -> storage `get` -> SHA-256 re-verification vs `checksum_sha256`
  *      -> Gemini adapter call -> strict catalog validation
- *      -> completion statement (fields batch + COMPLETED supersede + finalize)
+ *      -> S1 supersede statement -> S2 fields+finalize statement
  *      -> EXTRACTION_RUN audit.
  *
  * Freshness rule (schema contract): the CURRENT attempt is max(attempt) across
  * ALL statuses. Previous COMPLETED attempts are flipped to SUPERSEDED only
- * when a NEW attempt completes (inside the completing statement, respecting
- * the `extractions_completed_uq` partial unique index). A newer FAILED or
+ * when a NEW attempt completes (S1 of the completion sequence, before the new
+ * attempt is finalized against `extractions_completed_uq`). A newer FAILED or
  * PROCESSING attempt therefore still blocks downstream use of an older
  * COMPLETED attempt — downstream consumers MUST read max(attempt), which is
  * exactly the rule the earlier milestones established.
  *
  * Atomicity (neon-http driver — NO transactions across statements):
- * - Every write below is a single statement. The completion statement is ONE
- *   PostgreSQL statement (fields INSERT + previous-COMPLETED flip to
- *   SUPERSEDED + finalize to COMPLETED) — atomic like the upload CTE, with
- *   the partial unique index checked against the live index; CTE order
- *   dependency is the same documented reasoning as the upload statement.
- * - The attempt insert, the completion statement, the FAILED flip and the
- *   audit insert are NOT atomic with each other. Each failure point maps to a
- *   typed outcome; no claim of cross-statement atomicity is made anywhere.
+ * - Completion is TWO SEQUENTIAL statements, not one CTE. PostgreSQL §7.8.4
+ *   makes the execution order of sibling data-modifying CTEs UNPREDICTABLE,
+ *   so the earlier single tombstone+finalize statement could violate the
+ *   `extractions_completed_uq` partial unique index purely by scheduling.
+ *   Order is now deterministic by construction:
+ *     S1: UPDATE extractions SET status='SUPERSEDED'
+ *           WHERE document_id AND status='COMPLETED' AND id<>attempt
+ *         RETURNING id                                  (own transaction)
+ *     S2: fields batch INSERT + finalize to COMPLETED in ONE statement —
+ *         the partial unique index cannot conflict because S1 already
+ *         released the prior COMPLETED entry. S2's `finalize` CTE also
+ *         re-verifies `status='PROCESSING'`; a NULL finalize result means
+ *         the attempt was moved out from under us and nothing is finalized.
+ *   Partial-failure window (honest disclosure): if S1 committed but S2 then
+ *   fails, the previous COMPLETED attempt is ALREADY SUPERSEDED (no longer
+ *   current) while the new attempt is NOT COMPLETED — the document has no
+ *   current completed extraction until a later attempt completes. This is
+ *   reported as the distinct `supersede_incomplete` outcome (code
+ *   SUPERSEDE_INCOMPLETE in the attempt's audit row); recovery is a plain
+ *   retry (attempt N+1), and the max(attempt) rule keeps the stale rows
+ *   harmless to every downstream consumer.
+ * - The attempt insert, S1, S2, the FAILED flip and the audit insert are NOT
+ *   atomic with each other. Each failure point maps to a typed outcome; no
+ *   claim of cross-statement atomicity is made anywhere.
  *   Recovery semantics: a statement that aborts leaves its own writes rolled
- *   back (e.g. an aborted completion leaves the attempt in PROCESSING with no
+ *   back (e.g. an aborted S2 leaves the attempt in PROCESSING with no
  *   fields); the NEXT run creates attempt N+1 and the max(attempt) rule
- *   freezes the stale row out of downstream use. Stale PROCESSING rows are
- *   residue by design and need no migration to become harmless.
+ *   freezes the stale row out of downstream use.
+ * - Known residue: a crash between the attempt INSERT and a terminal write
+ *   leaves a PROCESSING row with no explanation. max(attempt) keeps it out of
+ *   downstream use, but NO reaping/recovery policy exists yet — one is still
+ *   needed in a later pass (do not assume otherwise).
  *
  * Daily ceiling (NOT a global quota — honest race disclosure):
  * - Before each attempt row, the service counts `extractions` rows created
@@ -61,7 +81,7 @@ import "server-only";
  */
 
 import { createHash, randomUUID } from "node:crypto";
-import { and, count, eq, gte, max, sql } from "drizzle-orm";
+import { and, count, eq, gte, inArray, max, ne, sql } from "drizzle-orm";
 
 import { USER_ROLES } from "@/lib/auth";
 import { buildExtractionResponseSchema, getExtractionFieldCatalog } from "@/lib/ai/extraction-catalogs";
@@ -70,7 +90,7 @@ import { GEMINI_EXTRACTION_MODEL, extractStructured } from "@/lib/ai/provider";
 import { EXTRACTION_DAILY_REQUEST_CEILING } from "@/lib/ai/request-ceiling";
 import { parseStructuredExtractionResponse } from "@/lib/ai/response-validation";
 import { db } from "@/lib/db";
-import { extractions, shipments } from "@/lib/db/schema";
+import { extractions, shipmentStatus, shipments } from "@/lib/db/schema";
 import { getSession, hasRole } from "@/lib/server/auth";
 import { cloudinaryStorage } from "@/lib/storage/cloudinary";
 import type { StorageGetResult } from "@/lib/storage/types";
@@ -105,8 +125,24 @@ const UUID_PATTERN =
  */
 const AUTO_ACCEPT_MIN_CONFIDENCE = 0.9;
 
-/** Extracting from an EXPORTED shipment is blocked (upload decision E analog). */
-const BLOCKED_STATUSES = ["EXPORTED"] as const;
+/**
+ * Shipment statuses eligible for extraction — an explicit ALLOW-LIST, not a
+ * block-list, so every new lifecycle status is blocked by default:
+ * - DRAFT: normal start.
+ * - PROCESSING: continuation of an in-flight extraction (or recovery of a
+ *   crashed run — an earlier attempt may remain PROCESSING).
+ * - REJECTED: rework — new documents may be uploaded to a REJECTED shipment
+ *   (upload decision E), so re-extraction is symmetric; the shipment flips
+ *   back to PROCESSING for the new round of work.
+ * REVIEW / AWAITING_APPROVAL / APPROVED / EXPORTED are BLOCKED: extraction
+ * output feeds human review, and replacing extracted values mid-review or
+ * under an approved/exported snapshot would invalidate the frozen review
+ * and approval data.
+ */
+const ELIGIBLE_STATUSES = ["DRAFT", "PROCESSING", "REJECTED"] as const;
+
+/** Statuses the lifecycle flip may move to PROCESSING (guarded in UPDATE). */
+const FLIP_TO_PROCESSING_FROM = ["DRAFT", "REJECTED"] as const;
 
 /** Sanitized error codes — the ONLY text persisted into extractions.error. */
 export type ExtractionErrorCode =
@@ -120,7 +156,35 @@ export type ExtractionErrorCode =
   | "PROVIDER_INVALID_OUTPUT"
   | "DAILY_CEILING"
   | "PERSISTENCE_FAILED"
+  | "SUPERSEDE_INCOMPLETE"
   | "INTERNAL_ERROR";
+
+/** A failed attempt — always paired with a sanitized error code. */
+export interface FailedExtractionOutcome {
+  status: "failed";
+  documentId: string;
+  documentType: DocumentEntryType;
+  attempt: number;
+  errorCode: ExtractionErrorCode;
+}
+
+/**
+ * Superseded-but-not-finalized (distinct from an ordinary failure): S1 of the
+ * completion sequence committed — the previous COMPLETED attempt is
+ * SUPERSEDED and NO LONGER CURRENT — but the new attempt could not be
+ * finalized to COMPLETED (S2 failed, or its finalize matched no PROCESSING
+ * row). The document has NO current completed extraction until a later
+ * attempt completes; recovery is a plain retry (attempt N+1). The attempt
+ * row carries FAILED / SUPERSEDE_INCOMPLETE so the state is explainable.
+ */
+export interface SupersedeIncompleteOutcome {
+  status: "supersede_incomplete";
+  documentId: string;
+  documentType: DocumentEntryType;
+  attempt: number;
+  /** How many prior COMPLETED rows S1 tombstoned before S2 failed. */
+  supersededAttemptCount: number;
+}
 
 export type DocumentExtractionOutcome =
   | {
@@ -132,14 +196,8 @@ export type DocumentExtractionOutcome =
       /** Required catalog keys with no extracted value (key names only). */
       missingRequiredKeys: readonly string[];
     }
-  | {
-      status: "failed";
-      documentId: string;
-      documentType: DocumentEntryType;
-      attempt: number;
-      /** 0 means no attempt row exists for this failure. */
-      errorCode: ExtractionErrorCode;
-    }
+  | FailedExtractionOutcome
+  | SupersedeIncompleteOutcome
   | {
       /** A concurrent run already owns the next attempt number. */
       status: "conflict";
@@ -154,18 +212,25 @@ export type DocumentExtractionOutcome =
       reason: "daily_ceiling" | "daily_count_unavailable";
     };
 
+/** The shipment-status union from the pg enum, for typed block reports. */
+type ShipmentStatusValue = (typeof shipmentStatus.enumValues)[number];
+
 export type RunExtractionResult =
   | { status: "unauthenticated" }
   | { status: "forbidden" }
   | { status: "shipment_not_found" }
-  | { status: "shipment_exported" }
+  | {
+      /** Shipment's live status is outside {@link ELIGIBLE_STATUSES}. */
+      status: "status_blocked";
+      currentStatus: ShipmentStatusValue;
+    }
   | { status: "no_documents" }
   | { status: "unavailable" }
   | { status: "status_update_failed" }
   | {
       status: "started";
-      /** Whether this run transitioned DRAFT -> PROCESSING (other
-       * non-DRAFT statuses are left to their existing milestone flow). */
+      /** Whether this run flipped the shipment (DRAFT or REJECTED) ->
+       * PROCESSING. If a concurrent run already flipped it, this is false. */
       flippedToProcessing: boolean;
       outcomes: readonly DocumentExtractionOutcome[];
     };
@@ -235,8 +300,8 @@ export async function runExtractionForShipment(
     return { status: "shipment_not_found" };
   }
 
-  // --- 2. Shipment export gate + active documents --------------------------
-  let shipmentStatus: string;
+  // --- 2. Eligibility gate (explicit allow-list) + active documents ---------
+  let liveStatus: ShipmentStatusValue;
   try {
     const statusRows = await db
       .select({ status: shipments.status })
@@ -246,13 +311,13 @@ export async function runExtractionForShipment(
     if (!statusRows[0]) {
       return { status: "shipment_not_found" };
     }
-    shipmentStatus = statusRows[0].status;
+    liveStatus = statusRows[0].status;
   } catch {
     console.error(`[extraction-service] Failed to read shipment status (shipmentId=${id}).`);
     return { status: "unavailable" };
   }
-  if ((BLOCKED_STATUSES as readonly string[]).includes(shipmentStatus)) {
-    return { status: "shipment_exported" };
+  if (!(ELIGIBLE_STATUSES as readonly string[]).includes(liveStatus)) {
+    return { status: "status_blocked", currentStatus: liveStatus };
   }
 
   const docsResult = await getActiveDocumentsForExtraction(id);
@@ -266,20 +331,49 @@ export async function runExtractionForShipment(
     return { status: "no_documents" };
   }
 
-  // --- 3. Lifecycle: DRAFT -> PROCESSING (single conditional statement) -----
+  // --- 3. Lifecycle: DRAFT|REJECTED -> PROCESSING (single guarded UPDATE) ---
+  // The inArray guard is the policy enforcement point: no shipment can reach
+  // PROCESSING from REVIEW/AWAITING_APPROVAL/APPROVED/EXPORTED through this
+  // code path even after a concurrent status change between the gate read
+  // and this UPDATE — the UPDATE would match 0 rows and the re-read below
+  // reports the live status instead.
   let flippedToProcessing = false;
-  try {
-    const flipped = await db
-      .update(shipments)
-      .set({ status: "PROCESSING" })
-      .where(and(eq(shipments.id, id), eq(shipments.status, "DRAFT")))
-      .returning({ id: shipments.id });
-    flippedToProcessing = flipped.length > 0;
-  } catch {
-    console.error(
-      `[extraction-service] Shipment PROCESSING transition failed (shipmentId=${id}) — no documents processed.`,
-    );
-    return { status: "status_update_failed" };
+  if (liveStatus !== "PROCESSING") {
+    try {
+      const flipped = await db
+        .update(shipments)
+        .set({ status: "PROCESSING" })
+        .where(
+          and(
+            eq(shipments.id, id),
+            inArray(shipments.status, [...FLIP_TO_PROCESSING_FROM]),
+          ),
+        )
+        .returning({ id: shipments.id });
+      flippedToProcessing = flipped.length > 0;
+      if (!flippedToProcessing) {
+        // A concurrent run transitioned the status after our gate read.
+        // Re-read the LIVE status: only PROCESSING (another extraction run
+        // already owns the state) may continue; anything else is blocked.
+        const recheckRows = await db
+          .select({ status: shipments.status })
+          .from(shipments)
+          .where(eq(shipments.id, id))
+          .limit(1);
+        const current = recheckRows[0]?.status;
+        if (!current) {
+          return { status: "shipment_not_found" };
+        }
+        if (current !== "PROCESSING") {
+          return { status: "status_blocked", currentStatus: current };
+        }
+      }
+    } catch {
+      console.error(
+        `[extraction-service] Shipment PROCESSING transition failed (shipmentId=${id}) — no documents processed.`,
+      );
+      return { status: "status_update_failed" };
+    }
   }
 
   // --- 4. Sequential per-document extraction -------------------------------
@@ -483,11 +577,49 @@ const extractOneDocument = async (
       };
     });
 
-  // --- D7. Completion in ONE statement: fields + SUPERSEDED + COMPLETED ----
-  // CTE order mirrors the upload statement: the previous COMPLETED row's
-  // partial-unique-index entry is released by the `supersede` UPDATE before
-  // `finalize` introduces the new COMPLETED row. Any constraint abort rolls
-  // the WHOLE statement back (attempt stays PROCESSING, no orphan fields).
+  // --- D7a. S1 — SUPERSEDE the previous COMPLETED attempt (first, committed
+  // as its own transaction). Deterministic order: the prior COMPLETED row's
+  // `extractions_completed_uq` index entry is released BEFORE S2 finalizes
+  // the new COMPLETED row. (The former single CTE cannot guarantee this —
+  // PostgreSQL §7.8.4: sibling data-modifying CTE execution order is
+  // UNPREDICTABLE.) The `status='COMPLETED'` predicate excludes this attempt
+  // itself (still PROCESSING); `id <> attemptId` is belt-and-braces.
+  let supersededCount = 0;
+  try {
+    const supersededRows = await db
+      .update(extractions)
+      .set({ status: "SUPERSEDED" })
+      .where(
+        and(
+          eq(extractions.documentId, document.id),
+          eq(extractions.status, "COMPLETED"),
+          ne(extractions.id, attemptId),
+        ),
+      )
+      .returning({ id: extractions.id });
+    supersededCount = supersededRows.length;
+  } catch (error) {
+    // S1 aborted in full — NOTHING was tombstoned, so no
+    // supersede-incomplete window exists: an ordinary failure outcome.
+    console.error(
+      `[extraction-service] S1 supersede statement failed ` +
+        `(documentId=${document.id}, attempt=${attempt}).`,
+    );
+    const constraint = findUniqueViolation(error);
+    return failAttempt(
+      shipmentId, document, attempt, attemptId, actorId,
+      constraint !== null ? "PERSISTENCE_FAILED" : "INTERNAL_ERROR",
+    );
+  }
+
+  // --- D7b. S2 — fields batch INSERT + finalize to COMPLETED in ONE statement
+  // (fields and attempt live in different tables, so the two CTEs have no
+  // ordering dependency; both are referenced by the main SELECT and therefore
+  // both run to completion). The `finalize` CTE re-verifies the attempt is
+  // STILL PROCESSING before the flip; a NULL `finalized_id` means the attempt
+  // was moved out from under us (concurrency) or is already final — then
+  // nothing is finalized and the inserted fields (if any) roll back with the
+  // aborted statement.
   try {
     const finalizeSql =
       rows.length > 0
@@ -525,14 +657,6 @@ const extractOneDocument = async (
         )}
         RETURNING id
       ),
-      supersede AS (
-        UPDATE extractions
-        SET status = 'SUPERSEDED'
-        WHERE document_id = ${document.id}
-          AND status = 'COMPLETED'
-          AND id <> ${attemptId}
-        RETURNING id
-      ),
       finalize AS (
         UPDATE extractions
         SET status = 'COMPLETED',
@@ -544,19 +668,10 @@ const extractOneDocument = async (
       )
       SELECT
         (SELECT count(*)::int FROM inserted_fields) AS field_count,
-        (SELECT count(*)::int FROM supersede) AS superseded_count,
         (SELECT f.id FROM finalize f LIMIT 1) AS finalized_id
     `
         : sql`
-      WITH supersede AS (
-        UPDATE extractions
-        SET status = 'SUPERSEDED'
-        WHERE document_id = ${document.id}
-          AND status = 'COMPLETED'
-          AND id <> ${attemptId}
-        RETURNING id
-      ),
-      finalize AS (
+      WITH finalize AS (
         UPDATE extractions
         SET status = 'COMPLETED',
             completed_at = now(),
@@ -567,26 +682,27 @@ const extractOneDocument = async (
       )
       SELECT
         0::int AS field_count,
-        (SELECT count(*)::int FROM supersede) AS superseded_count,
         (SELECT f.id FROM finalize f LIMIT 1) AS finalized_id
     `;
 
     const result = await db.execute<{
       field_count: number;
-      superseded_count: number;
       finalized_id: string | null;
     }>(finalizeSql);
 
     const summary = result.rows[0];
     if (!summary?.finalized_id) {
-      // The finalize UPDATE matched no PROCESSING row — the attempt was moved
-      // out from under us (concurrency) or is already final. Fields were
-      // rolled back with the aborted statement.
+      // The finalize UPDATE matched no PROCESSING row. If S1 tombstoned a
+      // prior COMPLETED attempt, this is the distinct partial-failure
+      // window: the previous COMPLETED attempt is ALREADY SUPERSEDED (no
+      // longer current) while this attempt is NOT COMPLETED.
       console.error(
-        `[extraction-service] Completion finalize matched no PROCESSING row ` +
+        `[extraction-service] S2 finalize matched no PROCESSING row ` +
           `(documentId=${document.id}, attemptId=${attemptId}).`,
       );
-      return failAttempt(shipmentId, document, attempt, attemptId, actorId, "PERSISTENCE_FAILED");
+      return await completeAfterSuperseded(
+        shipmentId, document, attempt, attemptId, actorId, supersededCount,
+      );
     }
 
     // --- D8. EXTRACTION_RUN audit (explicit failure policy) ----------------
@@ -607,7 +723,7 @@ const extractOneDocument = async (
           engine: GEMINI_EXTRACTION_MODEL,
           status: "COMPLETED",
           fieldCount: summary.field_count,
-          supersededCount: summary.superseded_count,
+          supersededCount,
           missingRequiredKeys,
         },
       });
@@ -636,22 +752,56 @@ const extractOneDocument = async (
       missingRequiredKeys,
     };
   } catch (error) {
+    // S2 aborted atomically (its own transaction): no fields, no finalize.
+    // If S1 already committed, the prior COMPLETED attempt is tombstoned —
+    // the supersede-incomplete window applies regardless of the S2 cause.
     const constraint = findUniqueViolation(error);
     if (constraint !== null) {
-      // Statement aborted atomically: no fields, no status change. The
-      // attempt row is PROCESSING residue; the next run creates attempt N+1.
       console.error(
-        `[extraction-service] Completion statement aborted (${constraint}) ` +
+        `[extraction-service] S2 finalize statement aborted (${constraint}) ` +
           `(documentId=${document.id}, attempt=${attempt}).`,
       );
-      return failAttempt(shipmentId, document, attempt, attemptId, actorId, "PERSISTENCE_FAILED");
+    } else {
+      console.error(
+        `[extraction-service] S2 finalize statement failed ` +
+          `(documentId=${document.id}, attempt=${attempt}).`,
+      );
     }
-    console.error(
-      `[extraction-service] Completion statement failed (documentId=${document.id}, ` +
-        `attempt=${attempt}).`,
+    return await completeAfterSuperseded(
+      shipmentId, document, attempt, attemptId, actorId, supersededCount,
     );
-    return failAttempt(shipmentId, document, attempt, attemptId, actorId, "INTERNAL_ERROR");
   }
+};
+
+/**
+ * Handle S2 failure AFTER S1 committed: when the prior COMPLETED attempt was
+ * tombstoned, return the distinct `supersede_incomplete` outcome (the attempt
+ * row carries FAILED / SUPERSEDE_INCOMPLETE with the supersede detail in its
+ * audit row) instead of an ordinary failure. When nothing was tombstoned,
+ * this is an ordinary persistence failure.
+ */
+const completeAfterSuperseded = async (
+  shipmentId: string,
+  document: ActiveExtractionDocument,
+  attempt: number,
+  attemptId: string,
+  actorId: string,
+  supersededCount: number,
+): Promise<DocumentExtractionOutcome> => {
+  if (supersededCount > 0) {
+    const failed = await failAttempt(
+      shipmentId, document, attempt, attemptId, actorId, "SUPERSEDE_INCOMPLETE",
+      { priorCompletedSuperseded: true, supersededCount },
+    );
+    return {
+      status: "supersede_incomplete",
+      documentId: failed.documentId,
+      documentType: failed.documentType,
+      attempt: failed.attempt,
+      supersededAttemptCount: supersededCount,
+    };
+  }
+  return failAttempt(shipmentId, document, attempt, attemptId, actorId, "PERSISTENCE_FAILED");
 };
 
 // ---------------------------------------------------------------------------
@@ -659,9 +809,13 @@ const extractOneDocument = async (
 /**
  * Flip an in-flight attempt to FAILED with a sanitized error code, then audit
  * the failure. Sub-statements are independent (neon-http): a FAILED flip that
- * cannot execute leaves the row as PROCESSING residue (typed {@link DocumentExtractionOutcome} still reports the
- * failure); an audit failure after a FAILED flip is logged for backfill — it
- * never retries or revives the extraction.
+ * cannot execute leaves the row as PROCESSING residue (the typed outcome
+ * still reports the failure); an audit failure after a FAILED flip is logged
+ * for backfill — it never retries or revives the extraction.
+ *
+ * `extraDetails` merges sanitized, JSON-safe context (ids/counts/flags only)
+ * into the audit payload — used e.g. to record that a prior COMPLETED attempt
+ * was already SUPERSEDED when the code is SUPERSEDE_INCOMPLETE.
  */
 const failAttempt = async (
   shipmentId: string,
@@ -670,7 +824,8 @@ const failAttempt = async (
   attemptId: string,
   actorId: string,
   errorCode: ExtractionErrorCode,
-): Promise<DocumentExtractionOutcome> => {
+  extraDetails: Record<string, unknown> = {},
+): Promise<FailedExtractionOutcome> => {
   try {
     const updated = await db
       .update(extractions)
@@ -704,6 +859,7 @@ const failAttempt = async (
         engine: GEMINI_EXTRACTION_MODEL,
         status: "FAILED",
         errorCode,
+        ...extraDetails,
       },
     });
   } catch {

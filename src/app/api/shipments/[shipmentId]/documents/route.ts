@@ -36,7 +36,9 @@
  *   404 shipment not found (including non-UUID shipment ids)
  *   409 duplicate checksum | concurrent upload conflict | EXPORTED shipment
  *   413 request or file over the size cap
- *   500 unexpected server failure
+ *   500 unexpected server failure (incl. replacement_incomplete — the client
+ *       is asked to re-upload; the service never reports that state as a
+ *       successful upload)
  *   502 storage provider unavailable
  */
 
@@ -246,16 +248,21 @@ export async function POST(
           },
           { status: 201 },
         );
-      case "readback_failed":
-        return Response.json(
-          {
-            status: "uploaded",
-            documentId: result.documentId,
-            warning:
-              "The document was saved and will appear after a refresh.",
-          },
-          { status: 201 },
+      case "replacement_incomplete": {
+        // The previous version was deactivated but the replacement insert
+        // failed — this shipment's document type temporarily has NO active
+        // document. The upload did not happen; a fresh upload recovers it
+        // (the service tolerates a type with zero active rows). Internal
+        // details stay server-side.
+        console.error(
+          `[document-upload-route] Replacement incomplete for shipment ` +
+            `${shipmentId} — client asked to re-upload.`,
         );
+        return jsonError(
+          500,
+          "The document could not be saved. Please try uploading it again.",
+        );
+      }
       case "invalid_input":
         // Size errors are a request-content problem → 413; all remaining
         // field messages (document type / MIME / filename) are 400s. The
