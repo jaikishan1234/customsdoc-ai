@@ -11,9 +11,17 @@ import {
 } from "@/lib/document-display";
 import { listDocumentsForShipment } from "@/lib/services/document-service";
 import { getShipmentById } from "@/lib/services/shipment-service";
+import {
+  listExtractionHistoryForShipment,
+  type ExtractedFieldValueView,
+  type ExtractionAttemptView,
+  type ExtractionDocumentView,
+  type ShipmentExtractionHistoryResult,
+} from "@/lib/services/extraction-read-service";
 import { requireSession } from "@/lib/server/auth";
 import type { ShipmentDocumentEntry } from "@/lib/services/document-service";
 import type { Shipment } from "@/lib/db/schema";
+import { ExtractionPanel } from "./extract-panel";
 
 export const metadata: Metadata = {
   title: "Shipment — CustomsDoc AI",
@@ -35,16 +43,18 @@ const monoValueClasses =
 
 const placeholderSections = [
   {
-    key: "extraction",
-    title: "AI extraction & cross-document validation",
-    note: "Field extraction with confidence plus cross-document discrepancy checks.",
-  },
-  {
     key: "approval",
     title: "Approval & export",
     note: "Manager approval decisions and export-ready CSV stamping.",
   },
 ] as const;
+
+/**
+ * Shipments whose status permits an extraction run — mirrors the service's
+ * ELIGIBLE_STATUSES allow-list (kept in explicit sync; the service stays the
+ * single enforcement point, this only gates the button's visibility).
+ */
+const EXTRACTION_ELIGIBLE_STATUSES = ["DRAFT", "PROCESSING", "REJECTED"] as const;
 
 /** Status pill styling for a document version's active/superseded state. */
 const DOCUMENT_VERSION_STATUS = {
@@ -92,6 +102,290 @@ function DocumentRow({ entry }: { entry: ShipmentDocumentEntry }) {
           ? ` · superseded ${formatLongDateTimeUtc(entry.supersededAt, "UTC")}`
           : null}
       </p>
+    </li>
+  );
+}
+
+/**
+ * Status pill styling map for extraction attempt statuses (mutually
+ * exclusive, one variant per pg enum value).
+ */
+const ATTEMPT_STATUS_PILLS = {
+  COMPLETED: {
+    label: "Completed",
+    className:
+      "inline-block whitespace-nowrap rounded-full border px-2 py-0.5 text-xs font-medium border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-300",
+  },
+  FAILED: {
+    label: "Failed",
+    className:
+      "inline-block whitespace-nowrap rounded-full border px-2 py-0.5 text-xs font-medium border-red-200 bg-red-50 text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300",
+  },
+  PROCESSING: {
+    label: "In progress",
+    className:
+      "inline-block whitespace-nowrap rounded-full border px-2 py-0.5 text-xs font-medium border-sky-200 bg-sky-50 text-sky-700 dark:border-sky-900 dark:bg-sky-950/40 dark:text-sky-300",
+  },
+  PENDING: {
+    label: "Pending",
+    className:
+      "inline-block whitespace-nowrap rounded-full border px-2 py-0.5 text-xs font-medium border-zinc-300 bg-zinc-100 text-zinc-600 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400",
+  },
+  SUPERSEDED: {
+    label: "Superseded",
+    className:
+      "inline-block whitespace-nowrap rounded-full border px-2 py-0.5 text-xs font-medium border-zinc-300 bg-zinc-100 text-zinc-600 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400",
+  },
+} as const;
+
+const ExtractionAttemptStatusPill = ({
+  status,
+}: {
+  status: ExtractionAttemptView["status"];
+}) => {
+  const known = ATTEMPT_STATUS_PILLS[status];
+  return (
+    <span className={known.className}>{known.label}</span>
+  );
+};
+
+/** Review-status pill: pending review must be visually obvious. */
+const REVIEW_STATUS_PILLS = {
+  PENDING_REVIEW: {
+    label: "Pending review",
+    className:
+      "inline-block whitespace-nowrap rounded-full border px-2 py-0.5 text-[11px] font-medium border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200",
+  },
+  ACCEPTED: {
+    label: "Accepted",
+    className:
+      "inline-block whitespace-nowrap rounded-full border px-2 py-0.5 text-[11px] font-medium border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-300",
+  },
+  CORRECTED: {
+    label: "Corrected",
+    className:
+      "inline-block whitespace-nowrap rounded-full border px-2 py-0.5 text-[11px] font-medium border-sky-200 bg-sky-50 text-sky-700 dark:border-sky-900 dark:bg-sky-950/40 dark:text-sky-300",
+  },
+} as const;
+
+const ReviewStatusPill = ({
+  status,
+}: {
+  status: ExtractedFieldValueView["reviewStatus"];
+}) => {
+  const known = REVIEW_STATUS_PILLS[status];
+  return <span className={known.className}>{known.label}</span>;
+};
+
+/** Client-friendly text for sanitized extraction error codes. */
+const EXTRACTION_ERROR_LABELS: Record<string, string> = {
+  STORAGE_NOT_FOUND: "Stored document no longer found",
+  STORAGE_KEY_INVALID: "Stored document reference invalid",
+  STORAGE_UNAVAILABLE: "Document storage temporarily unavailable",
+  CHECKSUM_MISMATCH: "Stored document failed the integrity check",
+  PROVIDER_UNAVAILABLE: "AI provider temporarily unavailable",
+  PROVIDER_RATE_LIMITED: "AI provider rate limit hit",
+  PROVIDER_REJECTED: "AI provider rejected the request",
+  PROVIDER_INVALID_OUTPUT: "AI output failed validation",
+  DAILY_CEILING: "Daily extraction ceiling reached",
+  PERSISTENCE_FAILED: "Results could not be saved",
+  SUPERSEDE_INCOMPLETE: "Retired the previous result but save incomplete",
+  INTERNAL_ERROR: "Internal error",
+};
+
+const formatConfidence = (confidence: string): string =>
+  // NUMERIC(4,3) arrives as text ("0.950"); display as a percentage.
+  `${Math.round(Number(confidence) * 100)}%`;
+
+/**
+ * One attempt's extracted fields as a definition list — label, value (+unit),
+ * confidence, page number and review status. Values are the parsed canonical
+ * strings the read service exposes; no raw documents or provider output.
+ */
+function ExtractedFieldList({ fields }: { fields: readonly ExtractedFieldValueView[] }) {
+  return (
+    <dl className="grid gap-x-8 gap-y-3 sm:grid-cols-2">
+      {fields.map((field) => (
+        <div
+          key={field.fieldKey}
+          className="flex flex-col gap-1 border-b border-dashed border-zinc-200 pb-2 dark:border-zinc-800"
+        >
+          <dt className="text-xs font-medium text-zinc-700 dark:text-zinc-300">
+            {field.fieldLabel}
+          </dt>
+          <dd className="flex flex-wrap items-center gap-x-2 gap-y-1">
+            <span
+              className={
+                field.reviewStatus === "PENDING_REVIEW"
+                  ? "break-all font-mono text-xs text-amber-800 dark:text-amber-200"
+                  : "break-all font-mono text-xs text-zinc-800 dark:text-zinc-200"
+              }
+            >
+              {field.parsedValue}
+              {field.unit ? ` ${field.unit}` : ""}
+            </span>
+            <span
+              title="Model confidence"
+              className="text-[11px] text-zinc-500 dark:text-zinc-400"
+            >
+              {formatConfidence(field.confidence)}
+            </span>
+            {field.pageNumber !== null ? (
+              <span
+                title="Page where the value was found"
+                className="text-[11px] text-zinc-500 dark:text-zinc-400"
+              >
+                p.{field.pageNumber}
+              </span>
+            ) : null}
+            <ReviewStatusPill status={field.reviewStatus} />
+          </dd>
+        </div>
+      ))}
+    </dl>
+  );
+}
+
+/**
+ * Compact attempt history rows for one document (newest first). Attempts are
+ * plain status/timestamp/error rows; fields render only in the labelled
+ * current / previous-completed blocks below.
+ */
+function AttemptHistoryRow({
+  attempt,
+  isCurrent,
+}: {
+  attempt: ExtractionAttemptView;
+  isCurrent: boolean;
+}) {
+  return (
+    <li className="flex flex-wrap items-center gap-x-3 gap-y-1 py-2 text-xs text-zinc-600 dark:text-zinc-300">
+      <span className="font-mono text-zinc-500 dark:text-zinc-400">
+        attempt {attempt.attempt}
+        {isCurrent ? " (current)" : ""}
+      </span>
+      <ExtractionAttemptStatusPill status={attempt.status} />
+      <span className="text-zinc-500 dark:text-zinc-400">
+        started{" "}
+        {attempt.startedAt
+          ? formatLongDateTimeUtc(attempt.startedAt, "UTC")
+          : "—"}
+      </span>
+      {attempt.completedAt ? (
+        <span className="text-zinc-500 dark:text-zinc-400">
+          finished {formatLongDateTimeUtc(attempt.completedAt, "UTC")}
+        </span>
+      ) : null}
+      {attempt.errorCode ? (
+        <span className="text-red-700 dark:text-red-300">
+          {EXTRACTION_ERROR_LABELS[attempt.errorCode] ?? attempt.errorCode}
+        </span>
+      ) : null}
+      <span className="text-zinc-400 dark:text-zinc-500" title="Engine/model">
+        engine: {attempt.engine}
+      </span>
+    </li>
+  );
+}
+
+/**
+ * One document block in the AI-extraction section: identity, the CURRENT
+ * attempt line, extracted fields of the current (or previous completed)
+ * attempt, and the bounded attempt history. An older COMPLETED attempt is
+ * rendered ONLY in the explicitly-labelled "no longer current" block — never
+ * as current data — because a newer FAILED/PROCESSING attempt owns freshness
+ * (max(attempt) rule).
+ */
+function ExtractionDocumentBlock({ group }: { group: ExtractionDocumentView }) {
+  const latest = group.latest;
+  const current =
+    latest && latest.status === "COMPLETED" && latest.fields.length > 0
+      ? latest
+      : null;
+  const previous = current
+    ? null
+    : (group.attempts.find(
+        (attempt) => attempt.status === "COMPLETED" && attempt.fields.length > 0,
+      ) ?? null);
+
+  return (
+    <li className="flex flex-col gap-2.5 py-3">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
+        <span className="break-all text-sm font-medium text-zinc-800 dark:text-zinc-100">
+          {group.documentFilename}
+        </span>
+        <span className="rounded-md bg-zinc-100 px-2 py-0.5 text-xs font-medium text-zinc-700 dark:bg-zinc-900 dark:text-zinc-200">
+          {formatDocumentTypeLabel(group.documentType)}
+        </span>
+        <span className="font-mono text-xs text-zinc-500 dark:text-zinc-400">
+          v{group.documentVersion}
+        </span>
+      </div>
+
+      {latest === null ? null : (
+        <>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-zinc-500 dark:text-zinc-400">
+            <span>
+              Current attempt: {latest.attempt}
+            </span>
+            <ExtractionAttemptStatusPill status={latest.status} />
+            {latest.status !== "COMPLETED" && latest.errorCode ? (
+              <span className="text-red-700 dark:text-red-300">
+                {EXTRACTION_ERROR_LABELS[latest.errorCode] ?? latest.errorCode}
+              </span>
+            ) : null}
+            <span title="Engine/model">engine: {latest.engine}</span>
+            {latest.startedAt ? (
+              <span>
+                started {formatLongDateTimeUtc(latest.startedAt, "UTC")}
+              </span>
+            ) : null}
+          </div>
+
+          {current ? (
+            <div className="flex flex-col gap-2">
+              <h4 className="text-xs font-semibold text-zinc-700 dark:text-zinc-300">
+                Extracted fields — attempt {current.attempt} (current)
+              </h4>
+              <ExtractedFieldList fields={current.fields} />
+            </div>
+          ) : (
+            <p className="rounded-lg border border-amber-200 bg-amber-50 p-2.5 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
+              The current attempt is not COMPLETED — there is no current
+              extracted data for this document. History below shows when this
+              changed; a new extraction run recovers it.
+            </p>
+          )}
+
+          {previous ? (
+            <div className="flex flex-col gap-2">
+              <h4 className="text-xs font-semibold text-zinc-500 dark:text-zinc-400">
+                Previous completed extraction — attempt {previous.attempt}
+              </h4>
+              <p className="text-[11px] italic text-amber-700 dark:text-amber-300">
+                No longer current: attempt {latest?.attempt} is the latest. Do
+                not use these values as fresh data.
+              </p>
+              <ExtractedFieldList fields={previous.fields} />
+            </div>
+          ) : null}
+
+          <details className="text-xs text-zinc-600 dark:text-zinc-300">
+            <summary className="cursor-pointer select-none">
+              Attempt history ({group.attempts.length})
+            </summary>
+            <ul className="mt-1 flex flex-col divide-y divide-zinc-200 dark:divide-zinc-800">
+              {group.attempts.map((attempt) => (
+                <AttemptHistoryRow
+                  key={attempt.id}
+                  attempt={attempt}
+                  isCurrent={attempt.id === latest.id}
+                />
+              ))}
+            </ul>
+          </details>
+        </>
+      )}
     </li>
   );
 }
@@ -257,6 +551,11 @@ export default async function ShipmentDetailPage({ params }: { params: Params })
     documentsResult.status === "success" ? documentsResult.entries : [];
   const documentsUnavailable = documentsResult.status === "unavailable";
 
+  // Read-only extraction history — attempts + extracted fields (typed,
+  // client-safe projections; not the privacy listing / storage contract).
+  const extractionHistory: ShipmentExtractionHistoryResult =
+    await listExtractionHistoryForShipment(id);
+
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-1 flex-col gap-6 px-4 py-8 sm:px-6">
       <header className="flex flex-col gap-3">
@@ -348,6 +647,41 @@ export default async function ShipmentDetailPage({ params }: { params: Params })
           <ol className="flex flex-col divide-y divide-zinc-200 dark:divide-zinc-800">
             {documentEntries.map((entry) => (
               <DocumentRow key={entry.id} entry={entry} />
+            ))}
+          </ol>
+        )}
+      </section>
+
+      {/* AI extraction — trigger + attempt history + extracted fields. */}
+      <section aria-label="AI extraction" className={panelClasses}>
+        <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">
+          AI extraction
+        </h2>
+        <p className="text-xs text-zinc-500 dark:text-zinc-400">
+          Attempt history and extracted values per document, newest attempt
+          first. Values marked pending review need human confirmation before
+          approval.
+        </p>
+        <ExtractionPanel
+          shipmentId={shipment.id}
+          canRun={(EXTRACTION_ELIGIBLE_STATUSES as readonly string[]).includes(
+            shipment.status,
+          )}
+          currentStatus={shipment.status}
+        />
+        {extractionHistory.status !== "success" ? (
+          <p className="rounded-xl border border-dashed border-zinc-300 p-6 text-center text-sm text-zinc-600 dark:border-zinc-700 dark:text-zinc-300">
+            Extraction data could not be loaded. Please try again.
+          </p>
+        ) : extractionHistory.documents.length === 0 ? (
+          <p className="rounded-xl border border-dashed border-zinc-300 p-6 text-center text-sm text-zinc-600 dark:border-zinc-700 dark:text-zinc-300">
+            No extraction attempts yet. Run extraction to pull values from the
+            active documents into the review-ready list below.
+          </p>
+        ) : (
+          <ol className="flex flex-col divide-y divide-zinc-200 dark:divide-zinc-800">
+            {extractionHistory.documents.map((group) => (
+              <ExtractionDocumentBlock key={group.documentId} group={group} />
             ))}
           </ol>
         )}

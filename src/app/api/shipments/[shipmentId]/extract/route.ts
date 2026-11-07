@@ -52,6 +52,7 @@
  */
 
 import { USER_ROLES } from "@/lib/auth";
+import type { DocumentEntryType } from "@/lib/services/document-service";
 import {
   runExtractionForShipment,
   type DocumentExtractionOutcome,
@@ -69,7 +70,69 @@ const EXTRACT_ROLES = [
 
 /** Uniform client-safe JSON error responses (upload-route convention). */
 const jsonError = (status: number, error: string): Response =>
-  Response.json({ error }, { status });
+  Response.json({ error } satisfies ExtractRunErrorBody, { status });
+
+/* --- Wire contract (server -> client). Type-only exports; no logic here
+ * may be (or is) imported by client components — they import TYPES only. */
+
+/** One per-document outcome as sent in the `started` (200) body. */
+export type ExtractDocumentOutcomeBody =
+  | {
+      status: "completed";
+      documentId: string;
+      documentType: DocumentEntryType;
+      attempt: number;
+      fieldCount: number;
+      missingRequiredKeys: readonly string[];
+      warning?: string;
+    }
+  | {
+      status: "supersede_incomplete";
+      documentId: string;
+      documentType: DocumentEntryType;
+      attempt: number;
+      supersededAttemptCount: number;
+      warning: string;
+    }
+  | {
+      status: "failed";
+      documentId: string;
+      documentType: DocumentEntryType;
+      attempt: number;
+      /** Sanitized error-code constant (never a raw provider message). */
+      errorCode: string;
+    }
+  | {
+      status: "conflict";
+      documentId: string;
+      documentType: DocumentEntryType;
+    }
+  | {
+      status: "skipped";
+      documentId: string;
+      documentType: DocumentEntryType;
+      reason: "daily_ceiling" | "daily_count_unavailable";
+    };
+
+/** The `started` (200) body. */
+export interface ExtractRunSuccessBody {
+  status: "started";
+  flippedToProcessing: boolean;
+  summary: {
+    completed: number;
+    failed: number;
+    conflict: number;
+    skipped: number;
+  };
+  documents: readonly ExtractDocumentOutcomeBody[];
+}
+
+/** Every failure body: one client-safe `error` string and nothing else. */
+export interface ExtractRunErrorBody {
+  error: string;
+}
+
+export type ExtractRunResponse = ExtractRunSuccessBody | ExtractRunErrorBody;
 
 /**
  * Per-instance in-flight fence (best-effort duplicate protection — see the
@@ -84,7 +147,9 @@ const inFlightExtractions = new Set<string>();
  * explicit and exhaustive, and to attach client-facing warnings for
  * partial-success states.
  */
-const projectOutcome = (outcome: DocumentExtractionOutcome) => {
+const projectOutcome = (
+  outcome: DocumentExtractionOutcome,
+): ExtractDocumentOutcomeBody => {
   switch (outcome.status) {
     case "completed":
       return {
@@ -257,7 +322,7 @@ export async function POST(
         flippedToProcessing: result.flippedToProcessing,
         summary: summarize(result.outcomes),
         documents: result.outcomes.map(projectOutcome),
-      },
+      } satisfies ExtractRunSuccessBody,
       { status: 200 },
     );
   } catch (error) {
