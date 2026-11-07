@@ -19,14 +19,20 @@ import "server-only";
  * - Object keys are provided by the caller (server-generated); as
  *   defense-in-depth the adapter re-validates the key shape and rejects
  *   anything that could smuggle traversal or provider-specific metadata.
+ * - Retrieval (`get`) is strictly server-side: authenticated raw assets are
+ *   read through signed Admin-API requests; no URL is ever returned, exposed
+ *   to the browser or logged, and no asset is ever made public.
  */
 
 import { v2 as cloudinary, type UploadApiResponse } from "cloudinary";
 
+import { DOCUMENT_MAX_SIZE_BYTES } from "@/lib/validation/document";
 import type {
+  GetObjectRequest,
   ObjectStorage,
   PutObjectRequest,
   PutObjectResult,
+  StorageGetResult,
 } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -165,6 +171,145 @@ const cloudinaryStorage: ObjectStorage = {
           : request.data.byteLength,
     };
   },
+
+  // ---------------------------------------------------------------------------
+  // Server-side retrieval (authenticated raw assets) — see StorageGetResult.
+  // ---------------------------------------------------------------------------
+
+  async get(request: GetObjectRequest): Promise<StorageGetResult> {
+    // The persisted key carries the provider prefix; only that exact scheme
+    // is accepted. The remainder must re-pass the same key-shape validation
+    // used at upload (defense-in-depth, same server-generated format).
+    if (
+      typeof request?.key !== "string" ||
+      !request.key.startsWith(CLOUDINARY_RAW_KEY_SCHEME)
+    ) {
+      return { status: "invalid_key" };
+    }
+    const publicId = request.key.slice(CLOUDINARY_RAW_KEY_SCHEME.length);
+    if (!isSafeStorageKey(publicId)) {
+      return { status: "invalid_key" };
+    }
+
+    // Signed Admin-API download endpoint (api.cloudinary.com), bearing the
+    // same api_secret-derived signature as every other Admin call. This is
+    // the SDK's supported mechanism for private/authenticated assets and is
+    // NOT CDN delivery — it works even where the account's PDF CDN flag is
+    // off (Free plan). The URL is consumed by the fetch below and is never
+    // returned to callers or logged; the result carries BYTES only.
+    let downloadUrl: string;
+    try {
+      downloadUrl = cloudinary.utils.private_download_url(publicId, "pdf", {
+        resource_type: "raw",
+        type: "authenticated",
+      });
+    } catch (error) {
+      console.error(
+        "[cloudinary-storage] Retrieval URL construction failed:",
+        error instanceof Error ? error.name : "unknown error type",
+      );
+      return { status: "unavailable" };
+    }
+
+    let response: Response;
+    try {
+      response = await fetch(downloadUrl, {
+        headers: { accept: "application/pdf" },
+        redirect: "follow",
+      });
+    } catch (error) {
+      console.error(
+        "[cloudinary-storage] Retrieval fetch failed:",
+        error instanceof Error ? error.name : "unknown error type",
+      );
+      return { status: "unavailable" };
+    }
+
+    // Missing asset = durable business state (e.g. reconciled orphans);
+    // anything else non-2xx is provider trouble. Only the status code is
+    // logged — never the URL, query signature or response body.
+    if (response.status === 404) {
+      return { status: "not_found" };
+    }
+    if (!response.ok) {
+      console.error(
+        `[cloudinary-storage] Retrieval unavailable (status=${response.status}).`,
+      );
+      return { status: "unavailable" };
+    }
+
+    // Size is fully bounded: a Content-Length pre-screen rejects deliberate
+    // over-cap declarations without reading, and the capped stream read is
+    // authoritative (mirrors the handler's uploader-side discipline; stored
+    // assets can never exceed this cap, so overshoot means tampering).
+    const declaredLength = Number(response.headers.get("content-length"));
+    if (
+      Number.isFinite(declaredLength) &&
+      declaredLength > DOCUMENT_MAX_SIZE_BYTES
+    ) {
+      console.error(
+        `[cloudinary-storage] Retrieval over declared size cap (declared=${declaredLength}).`,
+      );
+      return { status: "unavailable" };
+    }
+
+    const body = await readCappedResponse(response.body, DOCUMENT_MAX_SIZE_BYTES);
+    if (!body.ok) {
+      console.error(
+        "[cloudinary-storage] Retrieval exceeded the streaming size cap.",
+      );
+      return { status: "unavailable" };
+    }
+    if (body.data.byteLength === 0) {
+      console.error("[cloudinary-storage] Retrieved zero bytes for the asset.");
+      return { status: "unavailable" };
+    }
+
+    return {
+      status: "found",
+      data: body.data,
+      // Informational only — documents.mime_type stays authoritative.
+      contentType: response.headers.get("content-type"),
+      sizeBytes: body.data.byteLength,
+    };
+  },
+};
+
+/** Renders the capped read independent of how the body stream is obtained. */
+type CappableStream = ReadableStream<Uint8Array> | null;
+
+const readCappedResponse = async (
+  stream: CappableStream,
+  cap: number,
+): Promise<{ ok: true; data: Uint8Array<ArrayBuffer> } | { ok: false }> => {
+  if (!stream) {
+    return { ok: false };
+  }
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      received += value.byteLength;
+      if (received > cap) {
+        await reader.cancel();
+        return { ok: false };
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const data = new Uint8Array(received);
+  let offset = 0;
+  for (const chunk of chunks) {
+    data.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { ok: true, data };
 };
 
 export { cloudinaryStorage, isSafeStorageKey, CLOUDINARY_RAW_KEY_SCHEME };

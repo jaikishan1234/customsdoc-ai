@@ -513,3 +513,86 @@ export async function listDocumentsForShipment(
     return { status: "unavailable" };
   }
 }
+
+// ---------------------------------------------------------------------------
+// Extraction-scoped read (server-side ONLY)
+// ---------------------------------------------------------------------------
+
+/**
+ * One active document resolved for extraction. Unlike `ShipmentDocumentEntry`
+ * (the privacy-scoped detail-page listing), this intentionally includes the
+ * opaque `storageKey` and `checksumSha256` — both are consumed server-side
+ * only (storage `get` input, integrity verification). Neither this type's
+ * instances nor any aggregate containing them may ever be serialized to a
+ * client route/response.
+ */
+export interface ActiveExtractionDocument {
+  id: string;
+  shipmentId: string;
+  documentType: DocumentEntryType;
+  version: number;
+  /** Opaque stored-asset key (e.g. `cloudinary:raw:{publicId}`) — never a URL. */
+  storageKey: string;
+  /** Hex-64 SHA-256 recorded at upload — re-verification at retrieval time. */
+  checksumSha256: string;
+  mimeType: string;
+  sizeBytes: number;
+}
+
+export type ActiveExtractionDocumentsResult =
+  | { status: "success"; documents: ActiveExtractionDocument[] }
+  | { status: "not_found" }
+  | { status: "unavailable" };
+
+/**
+ * The active document rows of a shipment in pgEnum type order — the full set
+ * extraction operates on (exactly one active version per required type).
+ * Deliberately NOT built on `listDocumentsForShipment`'s privacy-scoped
+ * listing: this is a distinct server-side contract whose output is allowed to
+ * carries storage references. Same failure taxonomy as `getShipmentById`:
+ * strict UUID gate (`not_found` without a DB round-trip), shipment existence
+ * verified in the same Promise.all, DB failures logged with the shipment id
+ * only and reported as `unavailable`. Read-only; no mutations.
+ */
+export async function getActiveDocumentsForExtraction(
+  shipmentId: unknown,
+): Promise<ActiveExtractionDocumentsResult> {
+  const id = typeof shipmentId === "string" ? shipmentId.trim() : "";
+  if (!UUID_PATTERN.test(id)) {
+    return { status: "not_found" };
+  }
+
+  try {
+    const [shipmentRows, rows] = await Promise.all([
+      db
+        .select({ id: shipments.id })
+        .from(shipments)
+        .where(eq(shipments.id, id))
+        .limit(1),
+      db
+        .select({
+          id: documents.id,
+          shipmentId: documents.shipmentId,
+          documentType: documents.documentType,
+          version: documents.version,
+          storageKey: documents.storageKey,
+          checksumSha256: documents.checksumSha256,
+          mimeType: documents.mimeType,
+          sizeBytes: documents.sizeBytes,
+        })
+        .from(documents)
+        .where(and(eq(documents.shipmentId, id), eq(documents.isActive, true))),
+    ]);
+
+    if (!shipmentRows[0]) {
+      return { status: "not_found" };
+    }
+
+    return { status: "success", documents: rows };
+  } catch {
+    console.error(
+      `[document-service] Failed to load active documents for extraction (shipmentId=${id}).`,
+    );
+    return { status: "unavailable" };
+  }
+}
