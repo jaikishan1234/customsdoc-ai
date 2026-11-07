@@ -318,12 +318,36 @@ export const extractStructured = async (
     return { status: "rejected" };
   }
 
-  const text = await readCappedResponseText(response.body, GEMINI_MAX_RESPONSE_CHARS);
-  if (text === null) {
-    console.error("[gemini-provider] Response body missing or over the size cap.");
+  // --- Response-body phase -------------------------------------------------
+  // The 60s deadline also spans streaming the body. If it fires here (or the
+  // connection drops mid-body), reader.read() rejects. Without this guard that
+  // rejection would escape the adapter as an uncaught throw and leave the
+  // caller's attempt row in PROCESSING with no terminal state. Every failure
+  // in this phase is a typed result instead.
+  try {
+    const text = await readCappedResponseText(
+      response.body,
+      GEMINI_MAX_RESPONSE_CHARS,
+    );
+    if (text === null) {
+      console.error("[gemini-provider] Response body missing or over the size cap.");
+      return { status: "unavailable" };
+    }
+    return decodeStructuredResponse(text);
+  } catch (error) {
+    console.error(
+      `[gemini-provider] Response body read failure (${error instanceof Error ? error.name : "unknown error type"}).`,
+    );
     return { status: "unavailable" };
   }
+};
 
+/**
+ * Decode one complete response body: JSON envelope -> final output text ->
+ * structured JSON. Every risky step is guarded, so this never throws; nothing
+ * payload-derived is ever logged.
+ */
+const decodeStructuredResponse = (text: string): GeminiStructuredResult => {
   let responsePayload: unknown;
   try {
     responsePayload = JSON.parse(text);

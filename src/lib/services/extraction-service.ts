@@ -36,9 +36,11 @@ import "server-only";
  *   so the earlier single tombstone+finalize statement could violate the
  *   `extractions_completed_uq` partial unique index purely by scheduling.
  *   Order is now deterministic by construction:
- *     S1: UPDATE extractions SET status='SUPERSEDED'
+ *     S1: UPDATE extractions SET status='SUPERSEDED', completed_at=NULL
  *           WHERE document_id AND status='COMPLETED' AND id<>attempt
  *         RETURNING id                                  (own transaction)
+ *         (completed_at is cleared because the `extractions_completion` CHECK
+ *          requires it to be NULL for any non-COMPLETED row.)
  *     S2: fields batch INSERT + finalize to COMPLETED in ONE statement —
  *         the partial unique index cannot conflict because S1 already
  *         released the prior COMPLETED entry. S2's `finalize` CTE also
@@ -59,10 +61,13 @@ import "server-only";
  *   back (e.g. an aborted S2 leaves the attempt in PROCESSING with no
  *   fields); the NEXT run creates attempt N+1 and the max(attempt) rule
  *   freezes the stale row out of downstream use.
- * - Known residue: a crash between the attempt INSERT and a terminal write
- *   leaves a PROCESSING row with no explanation. max(attempt) keeps it out of
- *   downstream use, but NO reaping/recovery policy exists yet — one is still
- *   needed in a later pass (do not assume otherwise).
+ * - Residue: a crash between the attempt INSERT and a terminal write leaves
+ *   a PROCESSING row. Before creating a new attempt for that document, the
+ *   service recovers PROCESSING rows older than STALE_PROCESSING_AGE_MS as
+ *   FAILED/STALE_PROCESSING (with an audit entry) — see
+ *   `reapStaleProcessingAttempts` for the safety argument and its residual
+ *   risk. A reaped attempt can never be finalized to COMPLETED, so recovery
+ *   can lose a result but never fabricate one.
  *
  * Daily ceiling (NOT a global quota — honest race disclosure):
  * - Before each attempt row, the service counts `extractions` rows created
@@ -81,12 +86,16 @@ import "server-only";
  */
 
 import { createHash, randomUUID } from "node:crypto";
-import { and, count, eq, gte, inArray, max, ne, sql } from "drizzle-orm";
+import { and, count, eq, gte, inArray, lt, max, ne, sql } from "drizzle-orm";
 
 import { USER_ROLES } from "@/lib/auth";
 import { buildExtractionResponseSchema, getExtractionFieldCatalog } from "@/lib/ai/extraction-catalogs";
 import { buildExtractionPrompt } from "@/lib/ai/extraction-prompt";
-import { GEMINI_EXTRACTION_MODEL, extractStructured } from "@/lib/ai/provider";
+import {
+  GEMINI_EXTRACTION_MODEL,
+  extractStructured,
+  type GeminiStructuredResult,
+} from "@/lib/ai/provider";
 import { EXTRACTION_DAILY_REQUEST_CEILING } from "@/lib/ai/request-ceiling";
 import { parseStructuredExtractionResponse } from "@/lib/ai/response-validation";
 import { db } from "@/lib/db";
@@ -157,6 +166,8 @@ export type ExtractionErrorCode =
   | "DAILY_CEILING"
   | "PERSISTENCE_FAILED"
   | "SUPERSEDE_INCOMPLETE"
+  /** An attempt abandoned in PROCESSING was recovered as FAILED by a later run. */
+  | "STALE_PROCESSING"
   | "INTERNAL_ERROR";
 
 /** A failed attempt — always paired with a sanitized error code. */
@@ -389,6 +400,88 @@ export async function runExtractionForShipment(
 // Per-document lifecycle
 // ---------------------------------------------------------------------------
 
+/**
+ * Age after which a PROCESSING attempt is treated as abandoned.
+ *
+ * Safety argument: the provider call is capped at 60s by the adapter and every
+ * other step is a bounded statement, so no healthy run of THIS process lasts
+ * this long. Cross-instance safety: reaping an attempt that is still alive on
+ * another instance can only discard that run's result — S2's finalize requires
+ * `status='PROCESSING'` and matches 0 rows, so a reaped attempt can never be
+ * finalized to COMPLETED. Residual risk (documented, not solved here): the
+ * storage retrieval has no timeout of its own, so a storage fetch hung longer
+ * than this threshold would be reaped while alive. That loses a result; it can
+ * never fabricate or mislabel one.
+ */
+const STALE_PROCESSING_AGE_MS = 15 * 60 * 1000;
+
+/**
+ * Recover attempts abandoned in PROCESSING (crash or killed request between
+ * the attempt INSERT and its terminal write) for ONE document, right before a
+ * new attempt is created. Applies to stale rows only, is guarded by
+ * `status='PROCESSING'`, and audits every recovery so the trail explains the
+ * status change. Best-effort: a failure here never blocks the new run.
+ */
+const reapStaleProcessingAttempts = async (
+  shipmentId: string,
+  document: ActiveExtractionDocument,
+  actorId: string,
+): Promise<void> => {
+  const cutoff = new Date(Date.now() - STALE_PROCESSING_AGE_MS);
+
+  let reaped: Array<{ id: string; attempt: number }>;
+  try {
+    reaped = await db
+      .update(extractions)
+      .set({ status: "FAILED", error: "STALE_PROCESSING" })
+      .where(
+        and(
+          eq(extractions.documentId, document.id),
+          eq(extractions.status, "PROCESSING"),
+          lt(extractions.createdAt, cutoff),
+        ),
+      )
+      .returning({ id: extractions.id, attempt: extractions.attempt });
+  } catch {
+    console.error(
+      `[extraction-service] Stale-attempt recovery failed (documentId=${document.id}) ` +
+        `— continuing with the new attempt.`,
+    );
+    return;
+  }
+
+  for (const row of reaped) {
+    console.error(
+      `[extraction-service] Recovered stale PROCESSING attempt ` +
+        `(documentId=${document.id}, attemptId=${row.id}, attempt=${row.attempt}) ` +
+        `as FAILED/STALE_PROCESSING.`,
+    );
+    try {
+      await appendAuditLog({
+        action: AUDIT_ACTIONS.extractionRun,
+        entityType: AUDIT_ENTITY_TYPES.document,
+        entityId: document.id,
+        actorId,
+        shipmentId,
+        details: {
+          documentType: document.documentType,
+          version: document.version,
+          attempt: row.attempt,
+          engine: GEMINI_EXTRACTION_MODEL,
+          status: "FAILED",
+          errorCode: "STALE_PROCESSING",
+          recoveredAfterMs: STALE_PROCESSING_AGE_MS,
+        },
+      });
+    } catch {
+      console.error(
+        `[extraction-service] EXTRACTION_RUN audit write failed for recovered attempt ` +
+          `id=${row.id} (shipmentId=${shipmentId}) — audit trail requires manual backfill.`,
+      );
+    }
+  }
+};
+
 const extractOneDocument = async (
   shipmentId: string,
   document: ActiveExtractionDocument,
@@ -426,6 +519,11 @@ const extractOneDocument = async (
       reason: "daily_ceiling",
     };
   }
+
+  // --- D1b. Recover attempts abandoned in PROCESSING (stale only) ----------
+  // Runs before the new attempt row so no orphan is left unexplained, and
+  // never touches a fresh PROCESSING row (see the helper's safety argument).
+  await reapStaleProcessingAttempts(shipmentId, document, actorId);
 
   // --- D2. Attempt row: server-generated id, attempt = max(attempt) + 1 ----
   // The (documentId, attempt) unique index fences concurrent runs: a race
@@ -508,11 +606,25 @@ const extractOneDocument = async (
   // --- D5. Provider call via the pinned adapter ----------------------------
   // The instance-local counter inside the adapter reserves a slot too; a
   // race past the durable check can still surface `daily_ceiling_reached`.
-  const providerResult = await extractStructured({
-    prompt: buildExtractionPrompt(document.documentType),
-    schema: buildExtractionResponseSchema(document.documentType),
-    document: stored.data,
-  });
+  let providerResult: GeminiStructuredResult;
+  try {
+    providerResult = await extractStructured({
+      prompt: buildExtractionPrompt(document.documentType),
+      schema: buildExtractionResponseSchema(document.documentType),
+      document: stored.data,
+    });
+  } catch {
+    // The adapter is typed to return results, but a programmer-error assertion
+    // or an unexpected runtime failure must still end terminally. Without this
+    // guard the attempt row would stay PROCESSING with no audit entry.
+    console.error(
+      `[extraction-service] Provider adapter threw (documentId=${document.id}, ` +
+        `attempt=${attempt}) — recording a failed attempt.`,
+    );
+    return failAttempt(
+      shipmentId, document, attempt, attemptId, actorId, "INTERNAL_ERROR",
+    );
+  }
 
   if (providerResult.status !== "success") {
     const errorCode: ExtractionErrorCode = (() => {
@@ -584,11 +696,19 @@ const extractOneDocument = async (
   // PostgreSQL §7.8.4: sibling data-modifying CTE execution order is
   // UNPREDICTABLE.) The `status='COMPLETED'` predicate excludes this attempt
   // itself (still PROCESSING); `id <> attemptId` is belt-and-braces.
+  //
+  // `completed_at` MUST be cleared in the same statement: the schema CHECK
+  // `extractions_completion` asserts ((status = 'COMPLETED') = (completed_at
+  // IS NOT NULL)), so a SUPERSEDED row with a retained timestamp violates it
+  // (SQLSTATE 23514) and the whole supersede would abort — making every
+  // re-extraction of a document with a completed attempt fail. The previous
+  // COMPLETED row's completion time remains recorded in its EXTRACTION_RUN
+  // audit entry (performedAt).
   let supersededCount = 0;
   try {
     const supersededRows = await db
       .update(extractions)
-      .set({ status: "SUPERSEDED" })
+      .set({ status: "SUPERSEDED", completedAt: null })
       .where(
         and(
           eq(extractions.documentId, document.id),

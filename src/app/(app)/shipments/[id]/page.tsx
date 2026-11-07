@@ -190,6 +190,7 @@ const EXTRACTION_ERROR_LABELS: Record<string, string> = {
   DAILY_CEILING: "Daily extraction ceiling reached",
   PERSISTENCE_FAILED: "Results could not be saved",
   SUPERSEDE_INCOMPLETE: "Retired the previous result but save incomplete",
+  STALE_PROCESSING: "Abandoned attempt recovered",
   INTERNAL_ERROR: "Internal error",
 };
 
