@@ -415,6 +415,18 @@ export function ExtractionReviewPanel({
           <ol className="flex flex-col divide-y divide-zinc-200 dark:divide-zinc-800">
             {activeEntries.map((entry) => {
               const group = groupFor(entry.id);
+              // Freshness-aware counts (max(attempt) rule): field numbers are
+              // shown ONLY for the current COMPLETED attempt — historical
+              // values of a superseded group never read as current data.
+              const currentFields =
+                group && group.hasCurrentCompleted && group.latest
+                  ? group.latest.fields
+                  : null;
+              const pendingCount = currentFields
+                ? currentFields.filter(
+                    (field) => field.reviewStatus === "PENDING_REVIEW",
+                  ).length
+                : null;
               return (
                 <li
                   key={entry.id}
@@ -423,12 +435,22 @@ export function ExtractionReviewPanel({
                   <span className="rounded-md bg-zinc-100 px-2 py-0.5 text-xs font-medium text-zinc-700 dark:bg-zinc-900 dark:text-zinc-200">
                     {formatDocumentTypeLabel(entry.documentType)}
                   </span>
-                  <span className="break-all">{entry.originalFilename}</span>
                   {group?.latest ? (
                     <ExtractedAttemptStatusPill status={group.latest.status} />
                   ) : (
                     <span className={notRunPill}>Not run</span>
                   )}
+                  {/* Filenames intentionally omitted — the per-document
+                      sections below already identify each document. */}
+                  <span className="ml-auto text-zinc-500 dark:text-zinc-400">
+                    {currentFields
+                      ? `${currentFields.length} field${currentFields.length === 1 ? "" : "s"}${
+                          pendingCount && pendingCount > 0
+                            ? ` · ${pendingCount} pending review`
+                            : ""
+                        }`
+                      : null}
+                  </span>
                 </li>
               );
             })}
@@ -436,15 +458,25 @@ export function ExtractionReviewPanel({
         )}
       </section>
 
-      {/* 2. Run action — existing client panel, preserved untouched. */}
-      <section aria-label="Run extraction" className="flex flex-col gap-2">
-        <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">
-          Run extraction
-        </h2>
-        <p className="text-xs text-zinc-500 dark:text-zinc-400">
-          One AI request per active document; the resulting run becomes the
-          current attempt. Values flagged pending review need human
-          confirmation before approval.
+      {/* 2. Run action — distinct action area. Same ExtractionPanel client
+          component as before (same fetch, fences, states); only the framing
+          around it changed. */}
+      <section
+        aria-label="Run extraction"
+        className="my-2 flex flex-col gap-3 rounded-xl border border-zinc-200 bg-zinc-50 p-5 dark:border-zinc-800 dark:bg-zinc-900/50"
+      >
+        <div className="flex flex-col gap-1">
+          <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">
+            Run AI extraction
+          </h2>
+          <p className="text-xs text-zinc-500 dark:text-zinc-400">
+            Extract information from all active shipment documents.
+          </p>
+        </div>
+        <p className="text-xs font-medium text-zinc-700 dark:text-zinc-300">
+          {documentsUnavailable
+            ? "Active document count is unavailable."
+            : `${activeEntries.length} active document${activeEntries.length === 1 ? "" : "s"} will be processed.`}
         </p>
         <ExtractionPanel
           shipmentId={shipment.id}
