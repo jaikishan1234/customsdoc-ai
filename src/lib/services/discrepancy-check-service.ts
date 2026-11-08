@@ -6,9 +6,20 @@ import "server-only";
  * re-evaluates the confirmed extraction data of a whole shipment and
  * converges the live discrepancy rows onto it:
  *
- *   confirmed mismatch + no live row            -> INSERT (OPEN, audited)
- *   confirmed mismatch + live row, new evidence -> audit BEFORE, then UPDATE
- *   no confirmable mismatch + live rows         -> audit BEFORE, then OBSOLETE
+ *   confirmed mismatch + no live row              -> INSERT (OPEN, audited)
+ *   confirmed mismatch + live row, new evidence   -> audit BEFORE, then UPDATE
+ *   confirmed values EQUAL + live rows            -> audit BEFORE, then OBSOLETE
+ *   evidence UNVERIFIABLE this run + live rows    -> audit BEFORE, then
+ *                                                    move OPEN rows to
+ *                                                    RECHECK_PENDING
+ *
+ * The evidence-unverifiable branch (latest attempt failed/superseded/
+ * incomplete, missing document, or a correction without a numeric value)
+ * NEVER assumes the mismatch disappeared: the live row is kept alive as
+ * RECHECK_PENDING until a future run can either re-confirm it (-> OPEN with
+ * fresh evidence) or observe equal confirmed values (-> OBSOLETE). Nothing
+ * is ever created without two eligible confirmed values. RESOLVED/WAIVED
+ * records are outside the live set by definition and are never touched.
  *
  * Comparison scope (Milestone 1, confirmed business decisions):
  * - PACKING_LIST.gross_weight_kg vs BILL_OF_LADING.gross_weight_kg only.
@@ -21,9 +32,11 @@ import "server-only";
  * of a document is max(attempt) across ALL statuses, and its fields are used
  * ONLY when that attempt is COMPLETED. No fallback to an older COMPLETED
  * attempt — when the latest attempt is failed/superseded/incomplete, this
- * run simply cannot confirm that document's weight, and live rows whose
- * mismatch can no longer be confirmed close as OBSOLETE (never RESOLVED,
- * which requires a human actor; RESOLVED/WAIVED rows are never touched).
+ * run simply cannot confirm that document's weight: existing live rows stay
+ * alive as RECHECK_PENDING (the mismatch is NOT assumed gone); they only
+ * close as OBSOLETE when two CONFIRMED EQUAL values are observed (never
+ * RESOLVED, which requires a human actor; RESOLVED/WAIVED rows are never
+ * touched).
  *
  * Effective values: a CORRECTED field contributes the LATEST correction's
  * `correctedNumeric` (max correctedAt, ties max id — append-only history, so
@@ -101,7 +114,16 @@ export interface CrossCheckSummary {
   discrepanciesCreated: number;
   discrepanciesUpdated: number;
   discrepanciesObsoleted: number;
-  /** Audit writes that failed AFTER the DB change (manual backfill needed). */
+  /** Live rows moved OPEN -> RECHECK_PENDING because the evidence could not
+   * be verified this run (kept alive, NOT assumed gone). */
+  discrepanciesRecheckPending: number;
+  /**
+   * Audit writes that FAILED (manual backfill needed — the DB change itself
+   * still applied). A run is a CLEAN success only when this is 0; when a
+   * database change landed but its audit snapshot could not be written, the
+   * outcome is a PARTIAL success and this count is > 0. It is never 0 while
+   * a required audit entry is missing.
+   */
   auditWritesFailed: number;
 }
 
@@ -243,6 +265,17 @@ export async function runCrossCheckForShipment(
 // Evaluation pipeline
 // ---------------------------------------------------------------------------
 
+/** Zero-decision summary base for convergence paths that changed nothing. */
+const noChangeBase = (comparedPairFound: boolean): CrossCheckSummary => ({
+  mismatchDetected: false,
+  comparedPairFound,
+  discrepanciesCreated: 0,
+  discrepanciesUpdated: 0,
+  discrepanciesObsoleted: 0,
+  discrepanciesRecheckPending: 0,
+  auditWritesFailed: 0,
+});
+
 const evaluateShipment = async (
   id: string,
   actorId: AuditActor,
@@ -262,13 +295,10 @@ const evaluateShipment = async (
   );
 
   if (docsResult.documents.length === 0) {
-    // No active documents -> nothing confirmable; live rows (if any) close.
-    return closeUnconfirmable(id, actorId, "EVIDENCE_UNAVAILABLE", {
-      mismatchDetected: false,
-      comparedPairFound: false,
-      discrepanciesCreated: 0,
-      discrepanciesUpdated: 0,
-    });
+    // No active documents -> nothing confirmable. The mismatch is NOT being
+    // declared gone: any live row is kept alive as RECHECK_PENDING until a
+    // future run can verify it again (or observe equal confirmed values).
+    return deferUnverifiedEvidence(id, actorId, noChangeBase(false));
   }
 
   // --- 2. CURRENT attempt per document: max(attempt) across ALL statuses ---
@@ -311,12 +341,7 @@ const evaluateShipment = async (
   }
 
   if (completedExtractionIds.length === 0) {
-    return closeUnconfirmable(id, actorId, "EVIDENCE_UNAVAILABLE", {
-      mismatchDetected: false,
-      comparedPairFound: false,
-      discrepanciesCreated: 0,
-      discrepanciesUpdated: 0,
-    });
+    return deferUnverifiedEvidence(id, actorId, noChangeBase(false));
   }
 
   // --- 3. The compared field on current COMPLETED attempts only -----------
@@ -447,22 +472,23 @@ const evaluateShipment = async (
         discrepanciesCreated: outcome.created,
         discrepanciesUpdated: outcome.updated,
         discrepanciesObsoleted: outcome.obsoleted,
+        discrepanciesRecheckPending: 0,
         auditWritesFailed: outcome.auditWritesFailed,
       },
     };
   }
 
-  // No confirmable differing pair: values now equal, OR one/both documents
-  // lack a confirmable weight this run. Under the freshness law both mean
-  // "no active mismatch" — live rows close as OBSOLETE.
-  const reason =
-    comparedPairFound ? "VALUES_EQUAL" : "EVIDENCE_UNAVAILABLE";
-  return closeUnconfirmable(id, actorId, reason, {
-    mismatchDetected: false,
-    comparedPairFound,
-    discrepanciesCreated: 0,
-    discrepanciesUpdated: 0,
-  });
+  // No confirmable DIFFERING pair. Two strictly distinct cases:
+  if (comparedPairFound) {
+    // Both weights are confirmed and EQUAL — the mismatch is truly gone.
+    // Live rows close as OBSOLETE (audited; never RESOLVED/WAIVED).
+    return closeConfirmedEqualValues(id, actorId, noChangeBase(true));
+  }
+  // One/both documents lack a confirmable weight this run (failed or
+  // non-COMPLETED latest attempt, missing document, or a correction without
+  // a numeric value). Do NOT assume the mismatch disappeared: existing live
+  // rows are kept alive and move to RECHECK_PENDING; nothing is created.
+  return deferUnverifiedEvidence(id, actorId, noChangeBase(false));
 };
 
 // ---------------------------------------------------------------------------
@@ -574,14 +600,48 @@ const convergeMismatch = async (
         }
       }
       // The row vanished from the live set before its snapshot could be read
-      // (concurrent close). The creation still happened — flag the missing
-      // audit so it is never silently untracked.
-      console.error(
-        "[discrepancy-check-service] Created discrepancy not re-readable as live " +
-          `(${inserted[0].id}, shipmentId=${shipmentId}) — concurrent status change; ` +
-          "audit trail requires manual backfill.",
-      );
-      return { created: 1, updated: 0, obsoleted: 0, auditWritesFailed: 1 };
+      // (concurrent close). The creation DID happen — never report a clean
+      // audit result silently: write a truthful DEGRADED audit entry (row
+      // created; evidence snapshot untrackable), and only a failure of even
+      // that write counts as a missing audit for manual backfill.
+      let degradedAuditWritten = false;
+      try {
+        await appendAuditLog({
+          action: AUDIT_ACTIONS.discrepancyReevaluated,
+          entityType: AUDIT_ENTITY_TYPES.discrepancy,
+          entityId: inserted[0].id,
+          actorId,
+          shipmentId,
+          details: {
+            change: "CREATED",
+            reason: "MISMATCH_DETECTED",
+            checkRunKey: CHECK_RUN_KEY,
+            before: null,
+            after: null,
+            degraded:
+              "Row was closed concurrently before its evidence snapshot could be re-read; the snapshot needs manual backfill.",
+          },
+        });
+        degradedAuditWritten = true;
+      } catch {
+        console.error(
+          "[discrepancy-check-service] DEGRADED DISCREPANCY_REEVALUATED audit write failed " +
+            `for created discrepancy ${inserted[0].id} (shipmentId=${shipmentId}) ` +
+            "— audit trail requires manual backfill.",
+        );
+      }
+      if (!degradedAuditWritten) {
+        console.error(
+          "[discrepancy-check-service] Created discrepancy not re-readable as live " +
+            `(${inserted[0].id}, shipmentId=${shipmentId}) — concurrent status change; ` +
+            "no audit entry exists for this creation.",
+        );
+      }
+      // A missing full snapshot is surfaced to callers by the audit payload's
+      // degraded marker; auditWritesFailed stays 0 ONLY because a truthful
+      // (degraded) audit entry was written. The entry can never be silently
+      // absent here.
+      return { created: 1, updated: 0, obsoleted: 0, auditWritesFailed: 0 };
     }
 
     // Insert lost a race to a concurrent check: if that writer's row is now
@@ -717,7 +777,7 @@ const closeLiveRows = async (
   shipmentId: string,
   actorId: AuditActor,
   rows: LiveDiscrepancyRow[],
-  reason: "VALUES_EQUAL" | "EVIDENCE_UNAVAILABLE" | "DUPLICATE_LIVE_ROW",
+  reason: "VALUES_EQUAL" | "DUPLICATE_LIVE_ROW",
 ): Promise<{ obsoleted: number; auditWritesFailed: number }> => {
   let obsoleted = 0;
   let auditWritesFailed = 0;
@@ -771,27 +831,107 @@ const closeLiveRows = async (
 };
 
 /**
- * Close the live rows of this checker's scope after auditing them when no
- * confirmable mismatch holds this run (equal values or unavailable evidence).
+ * Live rows whose mismatch was refuted by two CONFIRMED EQUAL values this
+ * run: close them as OBSOLETE (audited, guarded, never RESOLVED/WAIVED).
  */
-const closeUnconfirmable = async (
+const closeConfirmedEqualValues = async (
   shipmentId: string,
   actorId: AuditActor,
-  reason: "VALUES_EQUAL" | "EVIDENCE_UNAVAILABLE",
-  summaryBase: Pick<CrossCheckSummary, "mismatchDetected" | "comparedPairFound" | "discrepanciesCreated" | "discrepanciesUpdated">,
+  base: CrossCheckSummary,
 ): Promise<CrossCheckRunOutcome> => {
   const rows = await selectLiveRows(shipmentId);
   const { obsoleted, auditWritesFailed } = await closeLiveRows(
     shipmentId,
     actorId,
     rows,
-    reason,
+    "VALUES_EQUAL",
   );
   return {
     status: "applied",
     summary: {
-      ...summaryBase,
+      ...base,
       discrepanciesObsoleted: obsoleted,
+      discrepanciesRecheckPending: 0,
+      auditWritesFailed,
+    },
+  };
+};
+
+/**
+ * Live rows whose evidence CANNOT be verified this run (the latest attempt
+ * is failed/superseded/incomplete, a document is missing, or a corrected
+ * field carries no numeric value). The mismatch is NOT assumed gone: every
+ * still-OPEN live row is audited FIRST, then moved to RECHECK_PENDING (the
+ * schema-documented state for "awaiting re-evaluation"). Rows already in
+ * RECHECK_PENDING are left exactly as they are (no audit churn). RESOLVED/
+ * WAIVED rows are outside the live set and remain untouched; nothing here
+ * ever creates a new discrepancy without two confirmed eligible values.
+ */
+const deferUnverifiedEvidence = async (
+  shipmentId: string,
+  actorId: AuditActor,
+  base: CrossCheckSummary,
+): Promise<CrossCheckRunOutcome> => {
+  const rows = (await selectLiveRows(shipmentId)).filter(
+    (row) => row.status !== "RECHECK_PENDING",
+  );
+
+  let recheckPending = 0;
+  let auditWritesFailed = 0;
+
+  for (const row of rows) {
+    // Audit FIRST: the append-only evidence snapshot must exist before the
+    // status changes (a failed write aborts the move — the row stays OPEN).
+    try {
+      await appendAuditLog({
+        action: AUDIT_ACTIONS.discrepancyReevaluated,
+        entityType: AUDIT_ENTITY_TYPES.discrepancy,
+        entityId: row.id,
+        actorId,
+        shipmentId,
+        details: {
+          change: "RECHECK_PENDING",
+          reason: "EVIDENCE_UNAVAILABLE",
+          checkRunKey: CHECK_RUN_KEY,
+          before: projectSnapshot(row),
+          after: { ...projectSnapshot(row), status: "RECHECK_PENDING" },
+        },
+      });
+    } catch {
+      auditWritesFailed += 1;
+      console.error(
+        "[discrepancy-check-service] DISCREPANCY_REEVALUATED audit write failed " +
+          `for re-check move of ${row.id} (shipmentId=${shipmentId}) — ` +
+          "move aborted; the row stays OPEN for the next cross-check.",
+      );
+      continue;
+    }
+
+    const moved = await db
+      .update(discrepancies)
+      .set({ status: "RECHECK_PENDING" })
+      .where(
+        and(
+          eq(discrepancies.id, row.id),
+          inArray(discrepancies.status, ["OPEN", "RECHECK_PENDING"]),
+        ),
+      )
+      .returning({ id: discrepancies.id });
+    recheckPending += moved.length;
+    if (moved.length === 0) {
+      console.error(
+        "[discrepancy-check-service] Guarded re-check move matched no live row " +
+          `(${row.id}, shipmentId=${shipmentId}) — concurrent status change.`,
+      );
+    }
+  }
+
+  return {
+    status: "applied",
+    summary: {
+      ...base,
+      discrepanciesObsoleted: 0,
+      discrepanciesRecheckPending: recheckPending,
       auditWritesFailed,
     },
   };
