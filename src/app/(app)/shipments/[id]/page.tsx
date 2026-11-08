@@ -11,6 +11,14 @@ import {
   listExtractionHistoryForShipment,
 } from "@/lib/services/extraction-read-service";
 import { listDiscrepanciesForShipment } from "@/lib/services/discrepancy-read-service";
+import {
+  evaluateShipmentReadiness,
+  type ShipmentReadinessResult,
+} from "@/lib/services/approval-service";
+import {
+  getShipmentApproval,
+  type ShipmentApprovalView,
+} from "@/lib/services/approval-read-service";
 import type {
   ExtractionDocumentView,
   ShipmentExtractionHistoryResult,
@@ -18,6 +26,7 @@ import type {
 import { hasRole, requireSession } from "@/lib/server/auth";
 
 import { ActivityPanel, describeAuditEntry } from "./activity-panel";
+import { ApprovalPanel } from "./approval-panel";
 import { DocumentsPanel, REQUIRED_DOCUMENT_TYPES } from "./documents-panel";
 import { ExtractionReviewPanel } from "./extraction-review-panel";
 import { ShipmentHeader } from "./shipment-header";
@@ -174,6 +183,25 @@ export default async function ShipmentDetailPage({
   }, 0);
   const countsKnown =
     !documentsUnavailable && extractionHistory.status === "success";
+
+  // Approval tab data only: readiness comes from the approval service (the
+  // exact rules the API enforces) and the decision is the client-safe read
+  // projection. Both are server-side; the panel never re-derives rules.
+  let approvalReadiness: ShipmentReadinessResult | null = null;
+  let approvalView: ShipmentApprovalView | null = null;
+  let approvalUnavailable = false;
+  if (activeTab === "approval") {
+    const [readinessResult, approvalResult] = await Promise.all([
+      evaluateShipmentReadiness(id),
+      getShipmentApproval(id),
+    ]);
+    approvalReadiness = readinessResult;
+    if (approvalResult.status === "success") {
+      approvalView = approvalResult.approval;
+    } else if (approvalResult.status === "unavailable") {
+      approvalUnavailable = true;
+    }
+  }
 
   const workspaceSummary = {
     activeDocumentCount: documentsUnavailable ? null : activeEntries.length,
@@ -368,6 +396,17 @@ export default async function ShipmentDetailPage({
           discrepancies={discrepancyList}
           discrepanciesUnavailable={discrepanciesUnavailable}
           canCorrect={canCorrect}
+        />
+      ) : activeTab === "approval" ? (
+        <ApprovalPanel
+          shipment={shipment}
+          readiness={approvalReadiness}
+          approval={approvalView}
+          approvalUnavailable={approvalUnavailable}
+          documentEntries={documentEntries}
+          documentsUnavailable={documentsUnavailable}
+          history={extractionHistory}
+          canDecide={canCorrect}
         />
       ) : (
         <section className={panelClasses}>

@@ -13,12 +13,18 @@ import Link from "next/link";
 /** Name of the URL search parameter holding the active tab. */
 export const TAB_SEARCH_PARAM = "tab";
 
-export type ShipmentTab = "overview" | "documents" | "extraction" | "activity";
+export type ShipmentTab =
+  | "overview"
+  | "documents"
+  | "extraction"
+  | "approval"
+  | "activity";
 
 const TAB_ITEMS: ReadonlyArray<{ value: ShipmentTab; label: string }> = [
   { value: "overview", label: "Overview" },
   { value: "documents", label: "Documents" },
   { value: "extraction", label: "Extraction & Review" },
+  { value: "approval", label: "Approval & Export" },
   { value: "activity", label: "Activity" },
 ];
 
