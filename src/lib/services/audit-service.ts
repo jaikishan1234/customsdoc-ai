@@ -20,6 +20,8 @@ export const AUDIT_ENTITY_TYPES = {
   shipment: "shipment",
   document: "document",
   approval: "approval",
+  /** The live discrepancy row touched by a cross-check re-evaluation. */
+  discrepancy: "discrepancy",
 } as const;
 
 export type AuditEntityType = (typeof AUDIT_ENTITY_TYPES)[keyof typeof AUDIT_ENTITY_TYPES];
@@ -29,6 +31,10 @@ export const AUDIT_ACTIONS = {
   shipmentCreate: "SHIPMENT_CREATE",
   documentUpload: "DOCUMENT_UPLOAD",
   extractionRun: "EXTRACTION_RUN",
+  /** Additive (schema-documented): cross-check evidence snapshot on the live
+   * discrepancy row it touches — before/after JSON for create, in-place
+   * update and automatic OBSOLETE closure. */
+  discrepancyReevaluated: "DISCREPANCY_REEVALUATED",
 } as const;
 
 export type AuditActor = string | null; // null = system

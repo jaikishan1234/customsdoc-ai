@@ -108,6 +108,7 @@ import {
   type ActiveExtractionDocument,
   type DocumentEntryType,
 } from "./document-service";
+import { runCrossCheckForShipment } from "./discrepancy-check-service";
 import {
   appendAuditLog,
   AUDIT_ACTIONS,
@@ -226,6 +227,28 @@ export type DocumentExtractionOutcome =
 /** The shipment-status union from the pg enum, for typed block reports. */
 type ShipmentStatusValue = (typeof shipmentStatus.enumValues)[number];
 
+/**
+ * Per-run cross-check outcome, carried alongside (never instead of) the
+ * per-document extraction outcomes:
+ * - applied: the checker converged discrepancies (counts include what it
+ *   created/updated/obsoleted; auditWritesFailed > 0 means one or more
+ *   evidence snapshots need manual backfill — the DB changes still applied).
+ * - deferred: a cross-check for the same shipment is already executing in
+ *   this process; that run re-evaluates the same state.
+ * - failed: shipment vanished or a checker error — extraction outcomes are
+ *   unaffected (a later run re-checks everything).
+ */
+export type ExtractionCrossCheckOutcome =
+  | {
+      status: "applied";
+      discrepanciesCreated: number;
+      discrepanciesUpdated: number;
+      discrepanciesObsoleted: number;
+      auditWritesFailed: number;
+    }
+  | { status: "deferred" }
+  | { status: "failed" };
+
 export type RunExtractionResult =
   | { status: "unauthenticated" }
   | { status: "forbidden" }
@@ -244,6 +267,10 @@ export type RunExtractionResult =
        * PROCESSING. If a concurrent run already flipped it, this is false. */
       flippedToProcessing: boolean;
       outcomes: readonly DocumentExtractionOutcome[];
+      /** One cross-document discrepancy check per run, run AFTER the
+       * sequential per-document loop. Its outcome is reported separately and
+       * NEVER demotes completed extraction outcomes. */
+      crossCheck: ExtractionCrossCheckOutcome;
     };
 
 /** Walk Drizzle/driver error `cause` chains for a unique violation. */
@@ -393,7 +420,26 @@ export async function runExtractionForShipment(
     outcomes.push(await extractOneDocument(id, document, actorId));
   }
 
-  return { status: "started", flippedToProcessing, outcomes };
+  // --- 5. Cross-document discrepancy check (non-blocking for extraction) --
+  // Exactly ONE re-evaluation per run, AFTER the whole per-document loop (a
+  // per-document check would churn N times while values are still being
+  // replaced). A failure here is reported in `crossCheck` and NEVER demotes
+  // completed extraction outcomes; the next run re-checks everything.
+  const crossCheckResult = await runCrossCheckForShipment(id, actorId);
+  const crossCheck: ExtractionCrossCheckOutcome =
+    crossCheckResult.status === "applied"
+      ? {
+          status: "applied",
+          discrepanciesCreated: crossCheckResult.summary.discrepanciesCreated,
+          discrepanciesUpdated: crossCheckResult.summary.discrepanciesUpdated,
+          discrepanciesObsoleted: crossCheckResult.summary.discrepanciesObsoleted,
+          auditWritesFailed: crossCheckResult.summary.auditWritesFailed,
+        }
+      : crossCheckResult.status === "skipped_concurrent"
+        ? { status: "deferred" }
+        : { status: "failed" };
+
+  return { status: "started", flippedToProcessing, outcomes, crossCheck };
 }
 
 // ---------------------------------------------------------------------------

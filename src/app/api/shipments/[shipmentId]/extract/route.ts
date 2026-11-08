@@ -125,6 +125,19 @@ export interface ExtractRunSuccessBody {
     skipped: number;
   };
   documents: readonly ExtractDocumentOutcomeBody[];
+  /** Per-run cross-document discrepancy check result (additive). A failure
+   * here does not affect the per-document outcomes above. */
+  crossCheck:
+    | {
+        status: "applied";
+        discrepanciesCreated: number;
+        discrepanciesUpdated: number;
+        discrepanciesObsoleted: number;
+        /** > 0 means evidence snapshots need manual audit backfill. */
+        auditWritesFailed: number;
+      }
+    | { status: "deferred" }
+    | { status: "failed" };
 }
 
 /** Every failure body: one client-safe `error` string and nothing else. */
@@ -322,6 +335,7 @@ export async function POST(
         flippedToProcessing: result.flippedToProcessing,
         summary: summarize(result.outcomes),
         documents: result.outcomes.map(projectOutcome),
+        crossCheck: result.crossCheck,
       } satisfies ExtractRunSuccessBody,
       { status: 200 },
     );
