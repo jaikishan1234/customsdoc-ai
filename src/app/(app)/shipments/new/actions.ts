@@ -32,15 +32,20 @@ export async function createShipmentAction(
   const result = await createShipment(formDataToRawInput(formData));
 
   switch (result.status) {
-    case "created":
-    case "created_audit_failed": {
-      // The shipment exists in both cases (audit failure is logged for manual
-      // backfill; the user must NOT resubmit the form, which the unique
-      // reference constraint would reject — and rightly so).
-      // Success: refresh the (future) shipment listing, then navigate to the
-      // detail page. Redirect is called without a wrapping try/catch.
+    case "created": {
+      // Success: refresh the shipment listing, then navigate to the detail
+      // page. Redirect is called without a wrapping try/catch.
       revalidatePath("/shipments");
       redirect(`/shipments/${result.shipment.id}`);
+    }
+
+    case "created_audit_failed": {
+      // The shipment exists, but its creation audit entry did not land. The
+      // user must NOT resubmit (the unique reference constraint would reject
+      // it — and rightly so), so the detail page carries an explicit warning
+      // instead of silently implying a fully audited creation.
+      revalidatePath("/shipments");
+      redirect(`/shipments/${result.shipment.id}?audit=missing`);
     }
 
     case "invalid_input":

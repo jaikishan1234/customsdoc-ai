@@ -113,6 +113,7 @@ import {
   appendAuditLog,
   AUDIT_ACTIONS,
   AUDIT_ENTITY_TYPES,
+  tryAppendAuditLog,
 } from "./audit-service";
 
 /** Postgres unique-violation SQLSTATE (walks Drizzle/driver cause chains). */
@@ -178,6 +179,8 @@ export interface FailedExtractionOutcome {
   documentType: DocumentEntryType;
   attempt: number;
   errorCode: ExtractionErrorCode;
+  /** True when this attempt's EXTRACTION_RUN audit write failed (backfill). */
+  auditMissing?: boolean;
 }
 
 /**
@@ -1011,24 +1014,23 @@ const failAttempt = async (
     );
   }
 
-  try {
-    await appendAuditLog({
-      action: AUDIT_ACTIONS.extractionRun,
-      entityType: AUDIT_ENTITY_TYPES.document,
-      entityId: document.id,
-      actorId,
-      shipmentId,
-      details: {
-        documentType: document.documentType,
-        version: document.version,
-        attempt,
-        engine: GEMINI_EXTRACTION_MODEL,
-        status: "FAILED",
-        errorCode,
-        ...extraDetails,
-      },
-    });
-  } catch {
+  const failedAttemptAudit = await tryAppendAuditLog({
+    action: AUDIT_ACTIONS.extractionRun,
+    entityType: AUDIT_ENTITY_TYPES.document,
+    entityId: document.id,
+    actorId,
+    shipmentId,
+    details: {
+      documentType: document.documentType,
+      version: document.version,
+      attempt,
+      engine: GEMINI_EXTRACTION_MODEL,
+      status: "FAILED",
+      errorCode,
+      ...extraDetails,
+    },
+  });
+  if (!failedAttemptAudit.ok) {
     console.error(
       `[extraction-service] EXTRACTION_RUN audit write failed for FAILED attempt ` +
         `id=${attemptId} (shipmentId=${shipmentId}) — audit trail requires manual backfill.`,
@@ -1041,5 +1043,6 @@ const failAttempt = async (
     documentType: document.documentType,
     attempt,
     errorCode,
+    auditMissing: !failedAttemptAudit.ok,
   };
 };

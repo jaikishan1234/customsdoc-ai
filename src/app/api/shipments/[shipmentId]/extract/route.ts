@@ -125,6 +125,10 @@ export interface ExtractRunSuccessBody {
     skipped: number;
   };
   documents: readonly ExtractDocumentOutcomeBody[];
+  /** True when at least one audit write for this run needs backfilling. */
+  auditMissing: boolean;
+  /** Client-safe warnings for partial-success states (empty when none). */
+  warnings: readonly string[];
   /** Per-run cross-document discrepancy check result (additive). A failure
    * here does not affect the per-document outcomes above. */
   crossCheck:
@@ -160,6 +164,45 @@ const inFlightExtractions = new Set<string>();
  * explicit and exhaustive, and to attach client-facing warnings for
  * partial-success states.
  */
+/**
+ * Client-safe audit-gap summary for one run: `auditMissing` is true whenever
+ * any reported audit write did not land, and every gap gets one fixed
+ * warning string (no ids, no raw errors).
+ */
+const summarizeAuditGaps = (
+  outcomes: readonly DocumentExtractionOutcome[],
+  crossCheck: ExtractRunSuccessBody["crossCheck"],
+): { auditMissing: boolean; warnings: string[] } => {
+  const warnings: string[] = [];
+
+  const completedAuditFailed = outcomes.filter(
+    (outcome) => outcome.status === "completed_audit_failed",
+  ).length;
+  if (completedAuditFailed > 0) {
+    warnings.push(
+      `${completedAuditFailed} audit ${completedAuditFailed === 1 ? "entry" : "entries"} for completed extraction${completedAuditFailed === 1 ? "" : "s"} could not be written and ${completedAuditFailed === 1 ? "needs" : "need"} backfilling.`,
+    );
+  }
+
+  const failedAuditMissing = outcomes.filter(
+    (outcome) => outcome.status === "failed" && outcome.auditMissing === true,
+  ).length;
+  if (failedAuditMissing > 0) {
+    warnings.push(
+      `${failedAuditMissing} failed attempt${failedAuditMissing === 1 ? "" : "s"} could not be audited — the audit ${failedAuditMissing === 1 ? "entry needs" : "entries need"} backfilling.`,
+    );
+  }
+
+  if (crossCheck.status === "applied" && crossCheck.auditWritesFailed > 0) {
+    const failed = crossCheck.auditWritesFailed;
+    warnings.push(
+      `The discrepancy re-evaluation finished, but ${failed} audit ${failed === 1 ? "entry" : "entries"} could not be written and ${failed === 1 ? "needs" : "need"} backfilling.`,
+    );
+  }
+
+  return { auditMissing: warnings.length > 0, warnings };
+};
+
 const projectOutcome = (
   outcome: DocumentExtractionOutcome,
 ): ExtractDocumentOutcomeBody => {
@@ -329,6 +372,7 @@ export async function POST(
     if (result.status !== "started") {
       return mapRunResult(result);
     }
+    const auditGaps = summarizeAuditGaps(result.outcomes, result.crossCheck);
     return Response.json(
       {
         status: "started" as const,
@@ -336,6 +380,8 @@ export async function POST(
         summary: summarize(result.outcomes),
         documents: result.outcomes.map(projectOutcome),
         crossCheck: result.crossCheck,
+        auditMissing: auditGaps.auditMissing,
+        warnings: auditGaps.warnings,
       } satisfies ExtractRunSuccessBody,
       { status: 200 },
     );

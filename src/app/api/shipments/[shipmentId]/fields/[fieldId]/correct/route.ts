@@ -72,6 +72,10 @@ export interface CorrectionSuccessBody {
   /** True: the FIELD_CORRECTED audit write failed — manual backfill needed. */
   auditWriteFailed: boolean;
   crossCheck: CorrectionCrossCheckBody;
+  /** True when any audit write for this correction needs backfilling. */
+  auditMissing: boolean;
+  /** Client-safe warnings for partial-success states (empty when none). */
+  warnings: readonly string[];
 }
 
 /** Every failure body: one client-safe `error` string and nothing else. */
@@ -186,6 +190,24 @@ export async function POST(
         }
       : crossCheck;
 
+  // Additive, machine-readable audit gap reporting: the business result stays
+  // successful, but the response never implies the trail is complete.
+  const auditWarnings: string[] = [];
+  if (result.auditWriteFailed) {
+    auditWarnings.push(
+      "The correction was saved, but its audit entry could not be written and needs backfilling.",
+    );
+  }
+  const crossCheckAuditFailures =
+    result.crossCheck.status === "applied"
+      ? result.crossCheck.summary.auditWritesFailed
+      : 0;
+  if (crossCheckAuditFailures > 0) {
+    auditWarnings.push(
+      `The discrepancy re-evaluation finished, but ${crossCheckAuditFailures} audit ${crossCheckAuditFailures === 1 ? "entry" : "entries"} could not be written and ${crossCheckAuditFailures === 1 ? "needs" : "need"} backfilling.`,
+    );
+  }
+
   return Response.json(
     {
       status: "corrected",
@@ -193,6 +215,8 @@ export async function POST(
       reviewStatus: "CORRECTED" as const,
       auditWriteFailed: result.auditWriteFailed,
       crossCheck: crossCheckBody,
+      auditMissing: auditWarnings.length > 0,
+      warnings: auditWarnings,
     } satisfies CorrectionSuccessBody,
     { status: 200 },
   );

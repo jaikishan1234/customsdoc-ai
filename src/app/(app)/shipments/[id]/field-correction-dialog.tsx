@@ -251,16 +251,24 @@ export function FieldCorrectionControl({
             role="status"
             className="rounded-lg border border-emerald-200 bg-emerald-50 p-2 text-xs text-emerald-800 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-200"
           >
-            Correction applied{state.body.auditWriteFailed
-              ? ", but its audit entry failed to write and needs manual backfill"
-              : ""}
-            . The cross-document check re-evaluated this shipment:{" "}
+            Correction applied. The cross-document check re-evaluated this
+            shipment:{" "}
             {state.body.crossCheck.status === "applied"
               ? `created ${state.body.crossCheck.discrepanciesCreated ?? 0}, updated ${state.body.crossCheck.discrepanciesUpdated ?? 0}, closed ${state.body.crossCheck.discrepanciesObsoleted ?? 0}, moved to re-check ${state.body.crossCheck.discrepanciesRecheckPending ?? 0}.`
               : state.body.crossCheck.status === "skipped_concurrent"
                 ? "a cross-check was already running for this shipment — the next one converges the state automatically."
                 : "the re-evaluation could not complete this time; the next extraction run or correction re-evaluates."}
           </p>
+          {state.body.warnings.length > 0 ? (
+            <ul
+              role="alert"
+              className="flex flex-col gap-1 rounded-lg border border-amber-200 bg-amber-50 p-2 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200"
+            >
+              {state.body.warnings.map((warning) => (
+                <li key={warning}>{warning}</li>
+              ))}
+            </ul>
+          ) : null}
           <p className="text-[11px] text-zinc-500 dark:text-zinc-400">
             The page has been refreshed with the corrected data.
           </p>

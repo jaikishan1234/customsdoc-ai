@@ -48,6 +48,25 @@ const detailString = (
   return null;
 };
 
+/**
+ * Mirrors the service-side degraded marker (kept local: this is a client
+ * module and must not import the server-only discrepancy service).
+ */
+const STATE_CHANGE_NOT_APPLIED = "state_change_not_applied";
+
+/**
+ * Display labels for the action an AUDIT_RECOVERED marker vouches for. A map
+ * keeps the timeline readable ("field value correction") instead of printing
+ * the raw action code or the referenced row's identifiers.
+ */
+const RECOVERED_ACTION_LABELS: Record<string, string> = {
+  [AUDIT_ACTIONS.shipmentCreate]: "shipment creation",
+  [AUDIT_ACTIONS.documentUpload]: "document upload",
+  [AUDIT_ACTIONS.extractionRun]: "extraction run",
+  [AUDIT_ACTIONS.fieldCorrected]: "field value correction",
+  [AUDIT_ACTIONS.discrepancyReevaluated]: "discrepancy re-evaluation",
+};
+
 const documentTypePart = (details: unknown): string | null => {
   const raw = detailString(details, "documentType");
   return raw === null
@@ -141,6 +160,29 @@ export const describeAuditEntry = (
     return { label: "Field value corrected", parts };
   }
 
+  if (entry.action === AUDIT_ACTIONS.auditRecovered) {
+    // Whitelist: the recovered action's label, the recovery timestamp and the
+    // operator note. The referenced audit row id (entity_id) and every other
+    // payload key are never rendered.
+    const recoveredAction = detailString(details, "recoveredAction");
+    const recoveredAt = detailString(details, "recoveredAt");
+    const note = detailString(details, "note");
+    const parts: string[] = [];
+    const recoveredLabel =
+      recoveredAction !== null
+        ? RECOVERED_ACTION_LABELS[recoveredAction]
+        : undefined;
+    if (recoveredLabel !== undefined) parts.push(recoveredLabel);
+    if (recoveredAt !== null) {
+      const recoveredDate = new Date(recoveredAt);
+      if (!Number.isNaN(recoveredDate.getTime())) {
+        parts.push(`recovered ${formatLongDateTimeUtc(recoveredDate, "UTC")}`);
+      }
+    }
+    if (note !== null) parts.push(note);
+    return { label: "Audit entry recovered", parts };
+  }
+
   if (entry.action === AUDIT_ACTIONS.discrepancyReevaluated) {
     // Strict whitelist: only `change` and `reason` are read from the JSONB
     // payload; the before/after snapshots, checkRunKey and any other keys
@@ -159,13 +201,17 @@ export const describeAuditEntry = (
     const parts: string[] = [];
     const mappedReason = reason !== null ? reasonLabels[reason] : undefined;
     if (mappedReason !== undefined) parts.push(mappedReason);
-    // Degraded audit entries mark an evidence snapshot that needs backfill.
-    const degraded =
-      details !== null &&
-      typeof details === "object" &&
-      !Array.isArray(details) &&
-      (details as Record<string, unknown>).degraded != null;
-    if (degraded) parts.push("evidence snapshot needs backfill");
+    // Degraded audit entries are explicit: either an evidence snapshot that
+    // needs backfill, or an audit-first change whose guarded update did not
+    // apply. Both are stated plainly; neither is silently hidden.
+    const degraded = detailString(details, "degraded");
+    if (degraded !== null) {
+      parts.push(
+        degraded === STATE_CHANGE_NOT_APPLIED
+          ? "audited state change did not apply"
+          : "evidence snapshot needs backfill",
+      );
+    }
 
     switch (change) {
       case "CREATED":

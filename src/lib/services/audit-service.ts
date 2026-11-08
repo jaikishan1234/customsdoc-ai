@@ -24,6 +24,8 @@ export const AUDIT_ENTITY_TYPES = {
   discrepancy: "discrepancy",
   /** A field_corrections row (human field correction; append-only). */
   fieldCorrection: "fieldCorrection",
+  /** A recovered (backfilled) audit row, referenced by its audit_logs id. */
+  auditEntry: "auditEntry",
 } as const;
 
 export type AuditEntityType = (typeof AUDIT_ENTITY_TYPES)[keyof typeof AUDIT_ENTITY_TYPES];
@@ -42,6 +44,11 @@ export const AUDIT_ACTIONS = {
    * never replaces the downstream DISCREPANCY_REEVALUATED evidence snapshots
    * written by the cross-check that re-evaluates the affected discrepancies. */
   fieldCorrected: "FIELD_CORRECTED",
+  /** Provenance marker for a recovered (backfilled) audit row. It references
+   * the reconstructed row by id and never replaces, mutates or re-audits it;
+   * the marker is itself an ordinary append-only row with a null (system)
+   * actor. Written only by an explicit operator-driven recovery. */
+  auditRecovered: "AUDIT_RECOVERED",
 } as const;
 
 export type AuditActor = string | null; // null = system
@@ -72,4 +79,30 @@ export async function appendAuditLog(entry: AuditLogEntry): Promise<void> {
     shipmentId: entry.shipmentId,
     details: entry.details ?? null,
   });
+}
+
+/** Outcome of a non-throwing audit write. */
+export interface AuditWriteResult {
+  /** True only when the row was accepted by the database. */
+  ok: boolean;
+}
+
+/**
+ * Non-throwing audit write for partial-success paths: business state is
+ * already persisted and the caller must report the gap instead of failing.
+ *
+ * Deliberately NO automatic retry: the neon-http driver can fail AFTER the
+ * statement committed, so a blind retry could duplicate an event. Recovery is
+ * explicit and must first check for an existing matching event (see
+ * AUDIT_RECOVERED / the audit-gap diagnostic).
+ */
+export async function tryAppendAuditLog(
+  entry: AuditLogEntry,
+): Promise<AuditWriteResult> {
+  try {
+    await appendAuditLog(entry);
+    return { ok: true };
+  } catch {
+    return { ok: false };
+  }
 }

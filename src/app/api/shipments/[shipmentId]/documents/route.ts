@@ -235,7 +235,12 @@ export async function POST(
     switch (result.status) {
       case "uploaded":
         return Response.json(
-          { status: "uploaded", documentId: result.document.id },
+          {
+            status: "uploaded",
+            documentId: result.document.id,
+            auditMissing: false,
+            warnings: [],
+          },
           { status: 201 },
         );
       case "uploaded_audit_failed":
@@ -243,6 +248,10 @@ export async function POST(
           {
             status: "uploaded",
             documentId: result.document.id,
+            auditMissing: true,
+            warnings: [
+              "The document was saved, but its audit entry could not be written and needs backfilling.",
+            ],
             warning:
               "The document was saved, but its audit entry needs backfilling.",
           },

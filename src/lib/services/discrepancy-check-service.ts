@@ -77,6 +77,7 @@ import {
   appendAuditLog,
   AUDIT_ACTIONS,
   AUDIT_ENTITY_TYPES,
+  tryAppendAuditLog,
   type AuditActor,
 } from "./audit-service";
 import {
@@ -637,11 +638,15 @@ const convergeMismatch = async (
             "no audit entry exists for this creation.",
         );
       }
-      // A missing full snapshot is surfaced to callers by the audit payload's
-      // degraded marker; auditWritesFailed stays 0 ONLY because a truthful
-      // (degraded) audit entry was written. The entry can never be silently
-      // absent here.
-      return { created: 1, updated: 0, obsoleted: 0, auditWritesFailed: 0 };
+      // A missing full snapshot is surfaced by the degraded marker, but the
+      // required entry only counts as written when it actually landed: a
+      // failed degraded write is a missing audit and is reported as one.
+      return {
+        created: 1,
+        updated: 0,
+        obsoleted: 0,
+        auditWritesFailed: degradedAuditWritten ? 0 : 1,
+      };
     }
 
     // Insert lost a race to a concurrent check: if that writer's row is now
@@ -656,6 +661,48 @@ const convergeMismatch = async (
   // Two failed attempts with no visible live row is pathological; surface it
   // as an unavailable run (the caller reports it, extraction stays intact).
   throw new Error("DISCREPANCY_LIVE_INSERT_RACE");
+};
+
+/** Degraded marker: the audited state change was not applied by its guard. */
+const STATE_CHANGE_NOT_APPLIED = "state_change_not_applied";
+
+/**
+ * Append one explicit follow-up when an audit-first change turned out NOT to
+ * be applied (the guarded UPDATE matched zero rows). The original snapshot is
+ * preserved and never rewritten; this entry states that the change did not
+ * land instead of claiming it succeeded. Best-effort by design: a failure is
+ * logged, never retried (no blind retries for audit inserts).
+ */
+const appendStateChangeNotApplied = async (
+  shipmentId: string,
+  actorId: AuditActor,
+  discrepancyId: string,
+  change: "UPDATED" | "OBSOLETED" | "RECHECK_PENDING",
+  reason:
+    | "EVIDENCE_CHANGED"
+    | "VALUES_EQUAL"
+    | "DUPLICATE_LIVE_ROW"
+    | "EVIDENCE_UNAVAILABLE",
+): Promise<void> => {
+  const result = await tryAppendAuditLog({
+    action: AUDIT_ACTIONS.discrepancyReevaluated,
+    entityType: AUDIT_ENTITY_TYPES.discrepancy,
+    entityId: discrepancyId,
+    actorId,
+    shipmentId,
+    details: {
+      change,
+      reason,
+      checkRunKey: CHECK_RUN_KEY,
+      degraded: STATE_CHANGE_NOT_APPLIED,
+    },
+  });
+  if (!result.ok) {
+    console.error(
+      "[discrepancy-check-service] Degraded state-change follow-up audit " +
+        `write failed (shipmentId=${shipmentId}) — the earlier snapshot stands.`,
+    );
+  }
 };
 
 /**
@@ -740,10 +787,18 @@ const applyMismatchToLive = async (
     updated = updatedRows.length;
     if (updated === 0) {
       // A concurrent flow closed the row between the audit and the update —
-      // the audited "after" did not happen (audit-only, no state change).
+      // the audited "after" did not happen. Record that explicitly instead of
+      // leaving an entry that implies the change succeeded.
       console.error(
         "[discrepancy-check-service] Guarded mismatch update matched no live row " +
           `(${primary.id}, shipmentId=${shipmentId}) — concurrent status change.`,
+      );
+      await appendStateChangeNotApplied(
+        shipmentId,
+        actorId,
+        primary.id,
+        "UPDATED",
+        "EVIDENCE_CHANGED",
       );
     }
   }
@@ -823,6 +878,13 @@ const closeLiveRows = async (
       console.error(
         "[discrepancy-check-service] Guarded obsolete close matched no live row " +
           `(${row.id}, shipmentId=${shipmentId}) — concurrent status change.`,
+      );
+      await appendStateChangeNotApplied(
+        shipmentId,
+        actorId,
+        row.id,
+        "OBSOLETED",
+        reason,
       );
     }
   }
@@ -922,6 +984,13 @@ const deferUnverifiedEvidence = async (
       console.error(
         "[discrepancy-check-service] Guarded re-check move matched no live row " +
           `(${row.id}, shipmentId=${shipmentId}) — concurrent status change.`,
+      );
+      await appendStateChangeNotApplied(
+        shipmentId,
+        actorId,
+        row.id,
+        "RECHECK_PENDING",
+        "EVIDENCE_UNAVAILABLE",
       );
     }
   }

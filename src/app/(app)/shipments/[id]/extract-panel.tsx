@@ -222,6 +222,16 @@ export function ExtractionPanel({
               : ""}
             . Results below have been refreshed.
           </p>
+          {state.body.warnings.length > 0 ? (
+            <ul
+              role="alert"
+              className="flex flex-col gap-1 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200"
+            >
+              {state.body.warnings.map((warning) => (
+                <li key={warning}>{warning}</li>
+              ))}
+            </ul>
+          ) : null}
           <ol className="flex flex-col divide-y divide-zinc-200 dark:divide-zinc-800">
             {state.body.documents.map((outcome, index) => (
               <li

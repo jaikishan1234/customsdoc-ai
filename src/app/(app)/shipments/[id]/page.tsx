@@ -39,6 +39,8 @@ export const instant = false;
 type Params = Promise<{ id: string }>;
 type SearchParams = Promise<{
   tab?: string | string[] | undefined;
+  /** "missing" when a mutation persisted data but its audit write failed. */
+  audit?: string | string[] | undefined;
 }>;
 
 const panelClasses =
@@ -82,6 +84,10 @@ export default async function ShipmentDetailPage({
   const { id } = await params;
   const query = await searchParams;
   const activeTab: ShipmentTab = parseShipmentTab(query.tab);
+  // Set only when business data was persisted but its audit write failed
+  // (shipment creation today) — the page must never imply a complete trail.
+  const auditGapFlagged =
+    (Array.isArray(query.audit) ? query.audit[0] : query.audit) === "missing";
 
   const result = await getShipmentById(id);
 
@@ -200,6 +206,17 @@ export default async function ShipmentDetailPage({
   return (
     <div className="mx-auto flex w-full max-w-4xl flex-1 flex-col gap-6 px-4 py-8 sm:px-6">
       <ShipmentHeader shipment={shipment} summary={workspaceSummary} />
+
+      {auditGapFlagged ? (
+        <p
+          role="alert"
+          className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200"
+        >
+          This shipment was saved, but its creation audit entry could not be
+          written and needs backfilling. Only the audit trail is affected —
+          the shipment data itself is intact.
+        </p>
+      ) : null}
 
       <ShipmentTabNav
         shipmentId={shipment.id}
