@@ -3,6 +3,11 @@
  * restructured as a workspace:
  *
  * Structure (top → bottom):
+ *   0. Cross-document discrepancies: active findings (OPEN, RECHECK_PENDING)
+ *      prominent, historical ones (RESOLVED/WAIVED/OBSOLETE) collapsed.
+ *      Purely read-only (this stage); data comes from the discrepancy read
+ *      service — unavailable reads render an explicit notice, never a fake
+ *      empty state.
  *   1. Extraction status overview: compact per-active-document rows.
  *   2. Run action: the existing ExtractionPanel client component, untouched
  *      (same fetch, fences, honest unconfirmed states, outcomes rendering).
@@ -31,6 +36,9 @@ import type {
   ExtractedFieldValueView,
   ShipmentExtractionHistoryResult,
 } from "@/lib/services/extraction-read-service";
+import type {
+  ShipmentDiscrepancyView,
+} from "@/lib/services/discrepancy-read-service";
 
 import { ExtractionPanel } from "./extract-panel";
 
@@ -381,11 +389,17 @@ export function ExtractionReviewPanel({
   history,
   documentEntries,
   documentsUnavailable,
+  discrepancies,
+  discrepanciesUnavailable,
 }: {
   shipment: Shipment;
   history: ShipmentExtractionHistoryResult;
   documentEntries: readonly ShipmentDocumentEntry[];
   documentsUnavailable: boolean;
+  /** Cross-document discrepancy rows (discrepancy read service) — read-only
+   * in this stage; empty array when the universe merely has no rows yet. */
+  discrepancies: readonly ShipmentDiscrepancyView[];
+  discrepanciesUnavailable: boolean;
 }) {
   const activeEntries = documentEntries.filter((entry) => entry.isActive);
   const groupFor = (documentId: string): ExtractionDocumentView | null =>
@@ -396,6 +410,12 @@ export function ExtractionReviewPanel({
 
   return (
     <div className="flex flex-col gap-6">
+      {/* 0. Cross-document discrepancies — prominent for active findings. */}
+      <DiscrepanciesSection
+        discrepancies={discrepancies}
+        unavailable={discrepanciesUnavailable}
+      />
+
       {/* 1. Extraction status overview — one compact row per active document. */}
       <section aria-label="Extraction overview" className="flex flex-col gap-2">
         <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">
@@ -511,5 +531,254 @@ export function ExtractionReviewPanel({
         )}
       </section>
     </div>
+  );
+}
+
+/* ---------------------------------------------------------------------------
+ * Cross-document discrepancies (read-only view; stage 1)
+ * -------------------------------------------------------------------------
+ */
+
+/** NUMERIC(14,4) evidence text ("45.0000") → display value ("45"); null-safe. */
+const formatEvidenceValue = (
+  value: string | null,
+  unit: string | null,
+): string => {
+  if (value === null) return "—";
+  const parsed = Number(value);
+  const formatted = Number.isFinite(parsed)
+    ? new Intl.NumberFormat("en-US", { maximumFractionDigits: 2 }).format(parsed)
+    : value;
+  return unit !== null ? `${formatted} ${unit}` : formatted;
+};
+
+const discrepancySeverityPillClasses: Record<string, string> = {
+  CRITICAL:
+    "inline-block whitespace-nowrap rounded-full border px-2 py-0.5 text-xs font-medium border-red-300 bg-red-50 text-red-800 dark:border-red-800 dark:bg-red-950/40 dark:text-red-200",
+  MEDIUM:
+    "inline-block whitespace-nowrap rounded-full border px-2 py-0.5 text-xs font-medium border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200",
+  LOW:
+    "inline-block whitespace-nowrap rounded-full border px-2 py-0.5 text-xs font-medium border-zinc-300 bg-zinc-100 text-zinc-600 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400",
+};
+
+const discrepancyStatusPillClasses: Record<string, string> = {
+  // OPEN: an active, unresolved finding — visibly blocking.
+  OPEN:
+    "inline-block whitespace-nowrap rounded-full border px-2 py-0.5 text-xs font-medium border-red-200 bg-red-50 text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300",
+  // RECHECK_PENDING: still live but its evidence is not verified — clearly
+  // distinct from OPEN, less alarming but never hidden.
+  RECHECK_PENDING:
+    "inline-block whitespace-nowrap rounded-full border px-2 py-0.5 text-xs font-medium border-amber-300 bg-amber-50 text-amber-800 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200",
+  RESOLVED:
+    "inline-block whitespace-nowrap rounded-full border px-2 py-0.5 text-xs font-medium border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-300",
+  WAIVED: notRunPill,
+  OBSOLETE: notRunPill,
+};
+
+const discrepancyStatusLabel: Record<string, string> = {
+  OPEN: "OPEN",
+  RECHECK_PENDING: "Re-check pending",
+  RESOLVED: "Resolved",
+  WAIVED: "Waived",
+  OBSOLETE: "Obsolete",
+};
+
+const statusNote: Record<string, string> = {
+  // Schema-documented rule: OPEN and RECHECK_PENDING block export at any
+  // severity; CRITICAL rows can never be waived.
+  OPEN:
+    "Active — this discrepancy blocks export while it stays open.",
+  RECHECK_PENDING:
+    "Re-check pending — the latest extraction evidence could not be verified, so the finding stays active.",
+  RESOLVED:
+    "Resolved by a human decision.",
+  WAIVED:
+    "Waived by a human decision.",
+  OBSOLETE:
+    "Automatically closed by a re-evaluation run — no longer an active mismatch.",
+};
+
+const sourceDocumentLabel = (
+  source: ShipmentDiscrepancyView["documentA"],
+): string =>
+  source === null
+    ? "Source document unavailable"
+    : `${formatDocumentTypeLabel(source.documentType)} v${source.documentVersion}`;
+
+/** One discrepancy presentation (active or collapsed historical). */
+function DiscrepancyCard({
+  discrepancy,
+  compact,
+}: {
+  discrepancy: ShipmentDiscrepancyView;
+  compact?: boolean;
+}) {
+  const resolved = discrepancy.resolvedAt !== null;
+  return (
+    <div
+      className={
+        compact
+          ? "rounded-lg border border-zinc-200 p-3 dark:border-zinc-800"
+          : "rounded-xl border border-zinc-200 p-4 dark:border-zinc-800"
+      }
+    >
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <span className={discrepancySeverityPillClasses[discrepancy.severity] ?? notRunPill}>
+          {discrepancy.severity === "CRITICAL"
+            ? "Critical"
+            : discrepancy.severity === "MEDIUM"
+              ? "Medium"
+              : "Low"}
+        </span>
+        <span className={discrepancyStatusPillClasses[discrepancy.status] ?? notRunPill}>
+          {discrepancyStatusLabel[discrepancy.status] ?? discrepancy.status}
+        </span>
+        {!compact ? (
+          <span className="ml-auto text-xs text-zinc-500 dark:text-zinc-400">
+            {discrepancy.status === "OPEN" || discrepancy.status === "RECHECK_PENDING"
+              ? "Active findings block export"
+              : resolved
+                ? `Resolved ${formatLongDateTimeUtc(discrepancy.resolvedAt!, "UTC")}`
+                : "Historical record"}
+          </span>
+        ) : null}
+      </div>
+
+      <h3
+        className={
+          compact
+            ? "mt-2 break-words text-sm font-medium text-zinc-900 dark:text-zinc-50"
+            : "mt-2 break-words text-sm font-semibold text-zinc-900 dark:text-zinc-50"
+        }
+      >
+        {discrepancy.title}
+      </h3>
+      {discrepancy.detail !== null ? (
+        <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+          {discrepancy.detail}
+        </p>
+      ) : null}
+
+      <dl
+        className={
+          compact
+            ? "mt-2 grid gap-x-6 gap-y-1 text-xs sm:grid-cols-2"
+            : "mt-3 grid gap-x-6 gap-y-2 text-sm sm:grid-cols-2"
+        }
+      >
+        <div className="flex flex-col gap-0.5">
+          <dt className="text-xs text-zinc-500 dark:text-zinc-400">
+            Expected (confirmed) {discrepancy.documentA !== null
+              ? `— ${formatDocumentTypeLabel(discrepancy.documentA.documentType)} v${discrepancy.documentA.documentVersion}`
+              : ""}
+          </dt>
+          <dd className={compact ? "text-xs text-zinc-800 dark:text-zinc-100" : "text-sm text-zinc-800 dark:text-zinc-100"}>
+            {sourceDocumentLabel(discrepancy.documentA)}:{" "}
+            {formatEvidenceValue(discrepancy.expectedValue, discrepancy.unit)}
+          </dd>
+        </div>
+        <div className="flex flex-col gap-0.5">
+          <dt className="text-xs text-zinc-500 dark:text-zinc-400">
+            Actual (confirmed) {discrepancy.documentB !== null
+              ? `— ${formatDocumentTypeLabel(discrepancy.documentB.documentType)} v${discrepancy.documentB.documentVersion}`
+              : ""}
+          </dt>
+          <dd className={compact ? "text-xs text-zinc-800 dark:text-zinc-100" : "text-sm text-zinc-800 dark:text-zinc-100"}>
+            {sourceDocumentLabel(discrepancy.documentB)}:{" "}
+            {formatEvidenceValue(discrepancy.actualValue, discrepancy.unit)}
+          </dd>
+        </div>
+        <div className="flex flex-col gap-0.5 sm:col-span-2">
+          <dt className="text-xs text-zinc-500 dark:text-zinc-400">Difference</dt>
+          <dd className="font-medium text-zinc-800 dark:text-zinc-100">
+            {formatEvidenceValue(discrepancy.deltaValue, discrepancy.unit)}
+          </dd>
+        </div>
+      </dl>
+
+      {discrepancy.resolutionNote !== null ? (
+        <p className="mt-2 text-xs text-zinc-600 dark:text-zinc-300">
+          Note: {discrepancy.resolutionNote}
+        </p>
+      ) : null}
+
+      <p className="mt-2 text-[11px] text-zinc-500 dark:text-zinc-400">
+        {statusNote[discrepancy.status] ?? null} Detected{" "}
+        {formatLongDateTimeUtc(discrepancy.createdAt, "UTC")} · Last updated{" "}
+        {formatLongDateTimeUtc(discrepancy.updatedAt, "UTC")}
+      </p>
+    </div>
+  );
+}
+
+/**
+ * Stage 1 discrepancies list: active findings (OPEN / RECHECK_PENDING)
+ * prominent, RESOLVED/WAIVED/OBSOLETE collapsed behind a disclosure.
+ * Strictly read-only — no resolve/waive actions in this stage.
+ */
+function DiscrepanciesSection({
+  discrepancies,
+  unavailable,
+}: {
+  discrepancies: readonly ShipmentDiscrepancyView[];
+  unavailable: boolean;
+}) {
+  const active = discrepancies.filter(
+    (discrepancy) =>
+      discrepancy.status === "OPEN" || discrepancy.status === "RECHECK_PENDING",
+  );
+  const historical = discrepancies.filter(
+    (discrepancy) =>
+      discrepancy.status !== "OPEN" && discrepancy.status !== "RECHECK_PENDING",
+  );
+
+  return (
+    <section
+      aria-label="Cross-document discrepancies"
+      className="flex flex-col gap-3"
+    >
+      <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+        <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">
+          Cross-document discrepancies
+        </h2>
+        <span className="text-xs text-zinc-500 dark:text-zinc-400">
+          {unavailable
+            ? null
+            : active.length > 0
+              ? `${active.length} active record${active.length === 1 ? "" : "s"}`
+              : "none active"}
+        </span>
+      </div>
+
+      {unavailable ? (
+        <p className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200">
+          Discrepancy data could not be loaded. This does NOT mean there are
+          no discrepancies — please try again.
+        </p>
+      ) : active.length === 0 ? (
+        <p className="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-xs text-emerald-800 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-200">
+          No active cross-document discrepancies. Every cross-check re-evaluates
+          the shipment after each extraction run.
+        </p>
+      ) : (
+        active.map((discrepancy) => (
+          <DiscrepancyCard key={discrepancy.id} discrepancy={discrepancy} />
+        ))
+      )}
+
+      {!unavailable && historical.length > 0 ? (
+        <details className="text-xs text-zinc-600 dark:text-zinc-300">
+          <summary className="cursor-pointer select-none">
+            Historical discrepancies ({historical.length} record
+            {historical.length === 1 ? "" : "s"} — resolved, waived or obsolete)
+          </summary>
+          <div className="mt-2 flex flex-col gap-2">
+            {historical.map((discrepancy) => (
+              <DiscrepancyCard key={discrepancy.id} discrepancy={discrepancy} compact />
+            ))}
+          </div>
+        </details>
+      ) : null}
+    </section>
   );
 }

@@ -9,6 +9,7 @@ import { getShipmentById } from "@/lib/services/shipment-service";
 import {
   listExtractionHistoryForShipment,
 } from "@/lib/services/extraction-read-service";
+import { listDiscrepanciesForShipment } from "@/lib/services/discrepancy-read-service";
 import type {
   ExtractionDocumentView,
   ShipmentExtractionHistoryResult,
@@ -121,6 +122,20 @@ export default async function ShipmentDetailPage({
   const extractionHistory: ShipmentExtractionHistoryResult =
     await listExtractionHistoryForShipment(id);
 
+  // Read-only cross-document discrepancy list — all statuses; the page
+  // derives the active count (OPEN + RECHECK_PENDING) for Overview guidance
+  // and hands the ordered list to the Extraction & Review panel.
+  const discrepanciesResult = await listDiscrepanciesForShipment(id);
+  const discrepancyList =
+    discrepanciesResult.status === "success"
+      ? [...discrepanciesResult.discrepancies]
+      : [];
+  const discrepanciesUnavailable = discrepanciesResult.status === "unavailable";
+  const activeDiscrepancyCount = discrepancyList.filter(
+    (discrepancy) =>
+      discrepancy.status === "OPEN" || discrepancy.status === "RECHECK_PENDING",
+  ).length;
+
   // --- Workspace summary (header row + Overview stats + tab pills) --------
   const extractionGroups = new Map<string, ExtractionDocumentView>(
     extractionHistory.status === "success"
@@ -171,9 +186,11 @@ export default async function ShipmentDetailPage({
           .join(", ")}) in the Documents tab.`
       : extractedCount < activeEntries.length
         ? "Run extraction for the not-yet-extracted documents in the Extraction & Review tab."
-        : pendingReviewCount > 0
-          ? `Review ${pendingReviewCount} pending extracted field value${pendingReviewCount === 1 ? "" : "s"} in the Extraction & Review tab.`
-          : "No pending extraction work for this shipment.";
+        : activeDiscrepancyCount > 0
+          ? `Open cross-document discrepanc${activeDiscrepancyCount === 1 ? "y" : "ies"} flagged in the Extraction & Review tab — manager review required before this shipment can progress; active discrepancies block export.`
+          : pendingReviewCount > 0
+            ? `Review ${pendingReviewCount} pending extracted field value${pendingReviewCount === 1 ? "" : "s"} in the Extraction & Review tab.`
+            : "No pending extraction work for this shipment.";
 
   return (
     <div className="mx-auto flex w-full max-w-4xl flex-1 flex-col gap-6 px-4 py-8 sm:px-6">
@@ -251,6 +268,12 @@ export default async function ShipmentDetailPage({
                     : "—"
                 }
               />
+              <Stat
+                label="Active discrepancies"
+                value={
+                  discrepanciesUnavailable ? "—" : String(activeDiscrepancyCount)
+                }
+              />
             </dl>
             <p className="rounded-lg border border-zinc-200 bg-zinc-50 p-3 text-sm text-zinc-700 dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-200">
               <span className="font-medium">Next step:</span> {nextStep}
@@ -320,6 +343,8 @@ export default async function ShipmentDetailPage({
           history={extractionHistory}
           documentEntries={documentEntries}
           documentsUnavailable={documentsUnavailable}
+          discrepancies={discrepancyList}
+          discrepanciesUnavailable={discrepanciesUnavailable}
         />
       ) : (
         <section className={panelClasses}>

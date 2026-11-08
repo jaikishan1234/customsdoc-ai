@@ -119,6 +119,52 @@ export const describeAuditEntry = (
     return { label: "Extraction run", parts: baseParts };
   }
 
+  if (entry.action === AUDIT_ACTIONS.discrepancyReevaluated) {
+    // Strict whitelist: only `change` and `reason` are read from the JSONB
+    // payload; the before/after snapshots, checkRunKey and any other keys
+    // (including on future changes) are NEVER rendered wholesale. The reason
+    // strings themselves are constant service vocabulary — mapped to labels,
+    // with unknown reasons omitted rather than printed verbatim.
+    const change = detailString(details, "change");
+    const reason = detailString(details, "reason");
+    const reasonLabels: Record<string, string> = {
+      MISMATCH_DETECTED: "mismatch detected",
+      EVIDENCE_CHANGED: "evidence changed",
+      VALUES_EQUAL: "confirmed values equal",
+      EVIDENCE_UNAVAILABLE: "evidence unavailable",
+      DUPLICATE_LIVE_ROW: "duplicate live record",
+    };
+    const parts: string[] = [];
+    const mappedReason = reason !== null ? reasonLabels[reason] : undefined;
+    if (mappedReason !== undefined) parts.push(mappedReason);
+    // Degraded audit entries mark an evidence snapshot that needs backfill.
+    const degraded =
+      details !== null &&
+      typeof details === "object" &&
+      !Array.isArray(details) &&
+      (details as Record<string, unknown>).degraded != null;
+    if (degraded) parts.push("evidence snapshot needs backfill");
+
+    switch (change) {
+      case "CREATED":
+        return { label: "Discrepancy detected", parts };
+      case "UPDATED":
+        return { label: "Discrepancy re-evaluated", parts };
+      case "OBSOLETED":
+        return { label: "Discrepancy closed as obsolete", parts };
+      case "RECHECK_PENDING":
+        return { label: "Discrepancy set for re-check", parts };
+      case "RESOLVED":
+        return { label: "Discrepancy resolved", parts };
+      case "WAIVED":
+        return { label: "Discrepancy waived", parts };
+      default:
+        // Unknown future change values: the generic label still shows, never
+        // the raw JSON payload.
+        return { label: "Discrepancy re-evaluated", parts };
+    }
+  }
+
   // Unknown/future action: show the raw action code (never hidden) plus a
   // safe whitelist of detail keys; anything non-whitelisted is omitted.
   const parts: string[] = [];
