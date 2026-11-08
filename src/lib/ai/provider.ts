@@ -73,7 +73,7 @@ const GEMINI_FILES_UPLOAD_ENDPOINT =
 const GEMINI_API_REVISION = "2026-05-20";
 
 /** Current stable Flash model with PDF input + structured outputs. */
-export const GEMINI_EXTRACTION_MODEL = "gemini-3.8-flash";
+export const GEMINI_EXTRACTION_MODEL = "gemini-3.5-flash-lite";
 
 /** Only PDFs are accepted by the upload policy (see validation/document.ts). */
 const GEMINI_PDF_MIME_TYPE = "application/pdf";
@@ -704,6 +704,11 @@ const generateFromFileUri = async (
         model: GEMINI_EXTRACTION_MODEL,
         // No Google-side interaction retention (see module docs) — always.
         store: false,
+        // Literal transcription into a fixed schema needs minimal reasoning;
+        // the 3.8-flash default is "On (medium)", which is suspected of
+        // consuming the whole 60 s generation budget before any output
+        // streams (docs: thinking levels low/medium/high for this model).
+        generation_config: { thinking_level: "low" },
         input: [
           {
             type: "document",
