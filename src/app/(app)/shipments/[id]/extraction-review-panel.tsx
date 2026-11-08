@@ -13,7 +13,12 @@
  *      (same fetch, fences, honest unconfirmed states, outcomes rendering).
  *   3. Per-document result cards: identity + current status, then a compact
  *      derived field summary, with the FULL field list collapsed behind a
- *      disclosure (two columns on sm+, one column on mobile).
+ *      disclosure (two columns on sm+, one column on mobile). Fields of the
+ *      CURRENT completed attempt carry a MANAGER-ONLY correction control
+ *      (session-verified DOCUMENTATION_MANAGER; the API re-verifies) — an
+ *      append-only correction with a mandatory reason that then re-evaluates
+ *      the shipment's discrepancies through the check service. Correction
+ *      history and the original snapshot stay visible on corrected fields.
  *   4. Attempt history: collapsed by default per document — technical
  *      metadata (engine, timestamps, sanitized error labels) lives there.
  *
@@ -39,6 +44,8 @@ import type {
 import type {
   ShipmentDiscrepancyView,
 } from "@/lib/services/discrepancy-read-service";
+
+import { FieldCorrectionControl } from "./field-correction-dialog";
 
 import { ExtractionPanel } from "./extract-panel";
 
@@ -161,54 +168,119 @@ const summarizeFields = (fields: readonly ExtractedFieldValueView[]) => {
 
 /**
  * Full field list — label, value (+unit), confidence, page number and review
- * status. Values are the parsed canonical strings the read service exposes;
- * responsive two columns on sm+, one on mobile. Callers collapse this behind
- * the compact summary.
+ * status. The displayed value is the field's EFFECTIVE value (latest
+ * correction first, original extraction otherwise); the original snapshot
+ * and the full append-only correction history stay visible below a
+ * corrected field. Manager-only correction controls (canCorrect) attach to
+ * fields of the CURRENT COMPLETED attempt only — history lists never offer
+ * corrections. Values are the parsed canonical strings / corrected values
+ * the read service exposes; responsive two columns on sm+, one on mobile.
+ * Callers collapse this behind the compact summary.
  */
 function ExtractedFieldList({
   fields,
+  shipmentId,
+  canCorrect,
+  isCurrentAttempt,
 }: {
   fields: readonly ExtractedFieldValueView[];
+  shipmentId: string;
+  canCorrect: boolean;
+  /**
+   * Corrections attach to a specific attempt's field row; only the current
+   * COMPLETED attempt of an active document offers them (the eligibility
+   * the correction service re-verifies server-side).
+   */
+  isCurrentAttempt: boolean;
 }) {
   return (
     <dl className="grid gap-x-8 gap-y-3 sm:grid-cols-2">
-      {fields.map((field) => (
-        <div
-          key={field.fieldKey}
-          className="flex flex-col gap-1 border-b border-dashed border-zinc-200 pb-2 dark:border-zinc-800"
-        >
-          <dt className="text-xs font-medium text-zinc-700 dark:text-zinc-300">
-            {field.fieldLabel}
-          </dt>
-          <dd className="flex flex-wrap items-center gap-x-2 gap-y-1">
-            <span
-              className={
-                field.reviewStatus === "PENDING_REVIEW"
-                  ? "break-all font-mono text-xs text-amber-800 dark:text-amber-200"
-                  : "break-all font-mono text-xs text-zinc-800 dark:text-zinc-200"
-              }
-            >
-              {field.parsedValue}
-              {field.unit ? ` ${field.unit}` : ""}
-            </span>
-            <span
-              title="Model confidence"
-              className="text-[11px] text-zinc-500 dark:text-zinc-400"
-            >
-              {formatConfidence(field.confidence)}
-            </span>
-            {field.pageNumber !== null ? (
+      {fields.map((field) => {
+        const effective =
+          field.corrections.length > 0
+            ? (field.corrections[field.corrections.length - 1] ?? null)
+            : null;
+        const effectiveValue = field.reviewStatus === "CORRECTED" && effective
+          ? effective.correctedValue
+          : field.parsedValue;
+        const effectiveUnit = field.reviewStatus === "CORRECTED" && effective
+          ? (effective.unit ?? field.unit)
+          : field.unit;
+        return (
+          <div
+            key={field.fieldId}
+            className="flex flex-col gap-1 border-b border-dashed border-zinc-200 pb-2 dark:border-zinc-800"
+          >
+            <dt className="text-xs font-medium text-zinc-700 dark:text-zinc-300">
+              {field.fieldLabel}
+            </dt>
+            <dd className="flex flex-wrap items-center gap-x-2 gap-y-1">
               <span
-                title="Page where the value was found"
+                className={
+                  field.reviewStatus === "PENDING_REVIEW"
+                    ? "break-all font-mono text-xs text-amber-800 dark:text-amber-200"
+                    : "break-all font-mono text-xs text-zinc-800 dark:text-zinc-200"
+                }
+              >
+                {effectiveValue}
+                {effectiveUnit ? ` ${effectiveUnit}` : ""}
+              </span>
+              {field.reviewStatus === "CORRECTED" ? (
+                <span
+                  title="Original extraction value (unchanged)"
+                  className="break-all font-mono text-[11px] text-zinc-500 line-through decoration-zinc-400 dark:text-zinc-400"
+                >
+                  {field.parsedValue}
+                  {field.unit ? ` ${field.unit}` : ""}
+                </span>
+              ) : null}
+              <span
+                title="Model confidence"
                 className="text-[11px] text-zinc-500 dark:text-zinc-400"
               >
-                p.{field.pageNumber}
+                {formatConfidence(field.confidence)}
               </span>
+              {field.pageNumber !== null ? (
+                <span
+                  title="Page where the value was found"
+                  className="text-[11px] text-zinc-500 dark:text-zinc-400"
+                >
+                  p.{field.pageNumber}
+                </span>
+              ) : null}
+              <ReviewStatusPill status={field.reviewStatus} />
+            </dd>
+
+            {/* Effective correction: original snapshot + append-only
+                history stay visible under the corrected field. */}
+            {field.corrections.length > 0 ? (
+              <div className="flex flex-col gap-0.5 text-[11px] text-zinc-500 dark:text-zinc-400">
+                {field.corrections.map((correction, correctionIndex) => (
+                  <p key={`${field.fieldId}-correction-${correctionIndex}`}>
+                    <span className="font-mono text-zinc-600 dark:text-zinc-300">
+                      {correction.correctedValue}
+                      {correction.unit ? ` ${correction.unit}` : ""}
+                    </span>{" "}
+                    · {formatLongDateTimeUtc(correction.correctedAt, "UTC")} ·
+                    reason: {correction.reason}
+                  </p>
+                ))}
+              </div>
             ) : null}
-            <ReviewStatusPill status={field.reviewStatus} />
-          </dd>
-        </div>
-      ))}
+
+            {canCorrect && isCurrentAttempt ? (
+              <FieldCorrectionControl
+                shipmentId={shipmentId}
+                fieldId={field.fieldId}
+                fieldLabel={field.fieldLabel}
+                originalValue={field.parsedValue}
+                unit={field.unit}
+                isNumeric={field.isNumeric}
+              />
+            ) : null}
+          </div>
+        );
+      })}
     </dl>
   );
 }
@@ -289,8 +361,13 @@ function FieldSummaryLine({
  */
 function ExtractionDocumentCard({
   group,
+  shipmentId,
+  canCorrect,
 }: {
   group: ExtractionDocumentView;
+  shipmentId: string;
+  /** Manager-only correction controls; executives never see them. */
+  canCorrect: boolean;
 }) {
   const latest = group.latest;
   const current =
@@ -336,7 +413,12 @@ function ExtractionDocumentCard({
               View extracted fields — attempt {current.attempt} (current)
             </summary>
             <div className="mt-2">
-              <ExtractedFieldList fields={current.fields} />
+              <ExtractedFieldList
+                fields={current.fields}
+                shipmentId={shipmentId}
+                canCorrect={canCorrect}
+                isCurrentAttempt
+              />
             </div>
           </details>
         </div>
@@ -359,7 +441,13 @@ function ExtractionDocumentCard({
             use these values as fresh data.
           </p>
           <div className="mt-2">
-            <ExtractedFieldList fields={previous.fields} />
+            {/* Superseded attempts are history — no correction actions. */}
+            <ExtractedFieldList
+              fields={previous.fields}
+              shipmentId={shipmentId}
+              canCorrect={false}
+              isCurrentAttempt={false}
+            />
           </div>
         </details>
       ) : null}
@@ -391,6 +479,7 @@ export function ExtractionReviewPanel({
   documentsUnavailable,
   discrepancies,
   discrepanciesUnavailable,
+  canCorrect,
 }: {
   shipment: Shipment;
   history: ShipmentExtractionHistoryResult;
@@ -400,6 +489,9 @@ export function ExtractionReviewPanel({
    * in this stage; empty array when the universe merely has no rows yet. */
   discrepancies: readonly ShipmentDiscrepancyView[];
   discrepanciesUnavailable: boolean;
+  /** True only for a DOCUMENTATION_MANAGER session (server-verified). The
+   * controls render nowhere else; the API re-verifies the role. */
+  canCorrect: boolean;
 }) {
   const activeEntries = documentEntries.filter((entry) => entry.isActive);
   const groupFor = (documentId: string): ExtractionDocumentView | null =>
@@ -526,7 +618,12 @@ export function ExtractionReviewPanel({
           </p>
         ) : (
           history.documents.map((group) => (
-            <ExtractionDocumentCard key={group.documentId} group={group} />
+            <ExtractionDocumentCard
+              key={group.documentId}
+              group={group}
+              shipmentId={shipment.id}
+              canCorrect={canCorrect}
+            />
           ))
         )}
       </section>

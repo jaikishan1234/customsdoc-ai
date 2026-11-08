@@ -4,6 +4,7 @@ import { notFound } from "next/navigation";
 
 import { formatLongDateTimeUtc } from "@/lib/date-display";
 import { formatDocumentTypeLabel } from "@/lib/document-display";
+import { USER_ROLES } from "@/lib/auth";
 import { listDocumentsForShipment } from "@/lib/services/document-service";
 import { getShipmentById } from "@/lib/services/shipment-service";
 import {
@@ -14,7 +15,7 @@ import type {
   ExtractionDocumentView,
   ShipmentExtractionHistoryResult,
 } from "@/lib/services/extraction-read-service";
-import { requireSession } from "@/lib/server/auth";
+import { hasRole, requireSession } from "@/lib/server/auth";
 
 import { ActivityPanel, describeAuditEntry } from "./activity-panel";
 import { DocumentsPanel, REQUIRED_DOCUMENT_TYPES } from "./documents-panel";
@@ -72,7 +73,11 @@ export default async function ShipmentDetailPage({
   searchParams: SearchParams;
 }) {
   // Protected by the (app) layout; re-read here for the verified session.
-  await requireSession();
+  const session = await requireSession();
+  // Correction is a manager decision on the server too — the flag below only
+  // hides the UI controls; the correction API independently re-verifies the
+  // DOCUMENTATION_MANAGER role on every request.
+  const canCorrect = hasRole(session, [USER_ROLES.DOCUMENTATION_MANAGER]);
 
   const { id } = await params;
   const query = await searchParams;
@@ -345,6 +350,7 @@ export default async function ShipmentDetailPage({
           documentsUnavailable={documentsUnavailable}
           discrepancies={discrepancyList}
           discrepanciesUnavailable={discrepanciesUnavailable}
+          canCorrect={canCorrect}
         />
       ) : (
         <section className={panelClasses}>

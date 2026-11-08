@@ -119,6 +119,28 @@ export const describeAuditEntry = (
     return { label: "Extraction run", parts: baseParts };
   }
 
+  if (entry.action === AUDIT_ACTIONS.fieldCorrected) {
+    // Strict whitelist: only the correction snapshot's display-relevant keys
+    // are read from the JSONB payload (label, unit, original/corrected
+    // values, reason). fieldId/extractionId/reviewStatusBefore and unknown
+    // keys are never rendered; the correcting actor lives solely on the
+    // audit row's own actorId column and is never displayed.
+    const fieldLabel = detailString(details, "fieldLabel");
+    const original = detailString(details, "originalValue");
+    const corrected = detailString(details, "correctedValue");
+    const unit = detailString(details, "unit");
+    const reason = detailString(details, "reason");
+    const parts: string[] = [];
+    if (fieldLabel !== null) parts.push(fieldLabel);
+    if (original !== null && corrected !== null) {
+      parts.push(`${original} → ${corrected}${unit ? ` ${unit}` : ""}`);
+    } else if (corrected !== null) {
+      parts.push(`to ${corrected}${unit ? ` ${unit}` : ""}`);
+    }
+    if (reason !== null) parts.push(`reason: ${reason}`);
+    return { label: "Field value corrected", parts };
+  }
+
   if (entry.action === AUDIT_ACTIONS.discrepancyReevaluated) {
     // Strict whitelist: only `change` and `reason` are read from the JSONB
     // payload; the before/after snapshots, checkRunKey and any other keys

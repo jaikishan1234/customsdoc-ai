@@ -22,6 +22,8 @@ export const AUDIT_ENTITY_TYPES = {
   approval: "approval",
   /** The live discrepancy row touched by a cross-check re-evaluation. */
   discrepancy: "discrepancy",
+  /** A field_corrections row (human field correction; append-only). */
+  fieldCorrection: "fieldCorrection",
 } as const;
 
 export type AuditEntityType = (typeof AUDIT_ENTITY_TYPES)[keyof typeof AUDIT_ENTITY_TYPES];
@@ -35,6 +37,11 @@ export const AUDIT_ACTIONS = {
    * discrepancy row it touches — before/after JSON for create, in-place
    * update and automatic OBSOLETE closure. */
   discrepancyReevaluated: "DISCREPANCY_REEVALUATED",
+  /** Additive (user-approved 2026-11): one human field correction — snapshots
+   * the original/corrected values and the mandatory correction reason. It
+   * never replaces the downstream DISCREPANCY_REEVALUATED evidence snapshots
+   * written by the cross-check that re-evaluates the affected discrepancies. */
+  fieldCorrected: "FIELD_CORRECTED",
 } as const;
 
 export type AuditActor = string | null; // null = system
