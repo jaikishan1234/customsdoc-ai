@@ -14,10 +14,12 @@
  *   3. Per-document result cards: identity + current status, then a compact
  *      derived field summary, with the FULL field list collapsed behind a
  *      disclosure (two columns on sm+, one column on mobile). Fields of the
- *      CURRENT completed attempt carry a MANAGER-ONLY correction control
- *      (session-verified DOCUMENTATION_MANAGER; the API re-verifies) — an
- *      append-only correction with a mandatory reason that then re-evaluates
- *      the shipment's discrepancies through the check service. Correction
+ *      CURRENT completed attempt carry MANAGER-ONLY review controls
+ *      (session-verified DOCUMENTATION_MANAGER; the APIs re-verify):
+ *      acceptance of a PENDING_REVIEW value asserts the original snapshot is
+ *      correct and changes review state only, while a correction is an
+ *      append-only change with a mandatory reason that re-evaluates the
+ *      shipment's discrepancies through the check service. Correction
  *      history and the original snapshot stay visible on corrected fields.
  *   4. Attempt history: collapsed by default per document — technical
  *      metadata (engine, timestamps, sanitized error labels) lives there.
@@ -45,6 +47,7 @@ import type {
   ShipmentDiscrepancyView,
 } from "@/lib/services/discrepancy-read-service";
 
+import { FieldAcceptControl } from "./field-accept-control";
 import { FieldCorrectionControl } from "./field-correction-dialog";
 
 import { ExtractionPanel } from "./extract-panel";
@@ -269,14 +272,23 @@ function ExtractedFieldList({
             ) : null}
 
             {canCorrect && isCurrentAttempt ? (
-              <FieldCorrectionControl
-                shipmentId={shipmentId}
-                fieldId={field.fieldId}
-                fieldLabel={field.fieldLabel}
-                originalValue={field.parsedValue}
-                unit={field.unit}
-                isNumeric={field.isNumeric}
-              />
+              <div className="mt-2 flex flex-wrap items-start gap-2">
+                {field.reviewStatus === "PENDING_REVIEW" ? (
+                  <FieldAcceptControl
+                    shipmentId={shipmentId}
+                    fieldId={field.fieldId}
+                    fieldLabel={field.fieldLabel}
+                  />
+                ) : null}
+                <FieldCorrectionControl
+                  shipmentId={shipmentId}
+                  fieldId={field.fieldId}
+                  fieldLabel={field.fieldLabel}
+                  originalValue={field.parsedValue}
+                  unit={field.unit}
+                  isNumeric={field.isNumeric}
+                />
+              </div>
             ) : null}
           </div>
         );

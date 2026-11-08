@@ -24,6 +24,8 @@ export const AUDIT_ENTITY_TYPES = {
   discrepancy: "discrepancy",
   /** A field_corrections row (human field correction; append-only). */
   fieldCorrection: "fieldCorrection",
+  /** An extracted_fields row whose reviewStatus was human-accepted. */
+  extractedField: "extractedField",
   /** A recovered (backfilled) audit row, referenced by its audit_logs id. */
   auditEntry: "auditEntry",
 } as const;
@@ -44,6 +46,17 @@ export const AUDIT_ACTIONS = {
    * never replaces the downstream DISCREPANCY_REEVALUATED evidence snapshots
    * written by the cross-check that re-evaluates the affected discrepancies. */
   fieldCorrected: "FIELD_CORRECTED",
+  /** Additive (stage 1 of the approval workflow): one human acceptance of a
+   * PENDING_REVIEW extracted field. It records the reviewed snapshot only —
+   * the original value/confidence are never modified. */
+  fieldAccepted: "FIELD_ACCEPTED",
+  /** Additive (stage 2): a manager approved a shipment with a frozen evidence
+   * snapshot. The snapshot itself lives on the approvals row; this event
+   * records the decision and provenance counts. */
+  approvalApproved: "APPROVAL_APPROVED",
+  /** Additive (stage 2): a manager rejected a shipment. The mandatory note is
+   * snapshotted in the event so the reason survives independently. */
+  approvalRejected: "APPROVAL_REJECTED",
   /** Provenance marker for a recovered (backfilled) audit row. It references
    * the reconstructed row by id and never replaces, mutates or re-audits it;
    * the marker is itself an ordinary append-only row with a null (system)

@@ -64,6 +64,7 @@ const RECOVERED_ACTION_LABELS: Record<string, string> = {
   [AUDIT_ACTIONS.documentUpload]: "document upload",
   [AUDIT_ACTIONS.extractionRun]: "extraction run",
   [AUDIT_ACTIONS.fieldCorrected]: "field value correction",
+  [AUDIT_ACTIONS.fieldAccepted]: "field value acceptance",
   [AUDIT_ACTIONS.discrepancyReevaluated]: "discrepancy re-evaluation",
 };
 
@@ -136,6 +137,19 @@ export const describeAuditEntry = (
     }
     if (status !== null) baseParts.push(status.toLowerCase());
     return { label: "Extraction run", parts: baseParts };
+  }
+
+  if (entry.action === AUDIT_ACTIONS.fieldAccepted) {
+    // Strict whitelist: label, accepted value and unit only. fieldId,
+    // extractionId and reviewStatusBefore are never rendered; the accepting
+    // actor lives solely on the audit row's own actorId column.
+    const fieldLabel = detailString(details, "fieldLabel");
+    const value = detailString(details, "value");
+    const unit = detailString(details, "unit");
+    const parts: string[] = [];
+    if (fieldLabel !== null) parts.push(fieldLabel);
+    if (value !== null) parts.push(`${value}${unit ? ` ${unit}` : ""}`);
+    return { label: "Field value accepted", parts };
   }
 
   if (entry.action === AUDIT_ACTIONS.fieldCorrected) {
