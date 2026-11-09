@@ -109,7 +109,7 @@ A worked example with synthetic documents (shipment `SHP-24811`) is documented i
 | Auth | Better Auth (email + password) with a Drizzle adapter |
 | Database | PostgreSQL on Neon (serverless `neon-http` driver) |
 | ORM | Drizzle ORM 0.45 + Drizzle Kit (migrations in `drizzle/`) |
-| AI | Google Gemini (Files API upload + Interactions API, structured output, plain `fetch` adapter — no SDK) |
+| AI | Google Gemini — production extraction model `gemini-3.5-flash-lite` (Files API upload + Interactions API, structured output, plain `fetch` adapter — no SDK) |
 | Storage | Cloudinary (free tier; private `raw` PDFs, authenticated access mode, signed server-side delivery) |
 
 #### Architecture principles (from the source)
@@ -246,7 +246,7 @@ Implemented, source-verified measures:
 - **AI hygiene.** Every Gemini interaction uses `store: false`; the uploaded file is deleted in a `finally` after generation (48 h expiry is only the fallback); nothing about request/response content is logged; provider artifacts (file names/URIs) are transient and never persisted.
 - **Input validation everywhere.** Strict reference format, correction kinds/limits, decision-note limits, UUID checks before DB access, strict catalog validation of model output.
 - **Tamper evidence and lifecycle protection.** Immutable document versions, attempt history, append-only corrections, snapshot-verified approvals, guarded one-shot export stamp, post-export mutation locks.
-- **Diagnostics are inert by default.** The Gemini probe and audit-gap report answer 404 unless explicitly enabled via environment flag, and are read-only.
+- **Diagnostics are inert by default.** The Gemini probe and audit-gap report answer 404 unless explicitly enabled via environment flag, and are read-only. The opt-in Gemini probe is a separate text-only check pinned to `gemini-3.8-flash` — it is not the production extraction model (`gemini-3.5-flash-lite`).
 
 Honest limitations (not "all risks eliminated"):
 

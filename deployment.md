@@ -158,11 +158,11 @@ How the app uses Cloudinary (no configuration action required on your side):
 
 How the app uses Gemini (no configuration action on your side):
 
-- Structured extraction through the **Files API** (PDF upload) + **Interactions API** (`model: gemini-3.8-flash`, Interactions API revision `2026-05-20`, per `src/lib/ai/provider.ts`), plain `fetch` adapter.
+- Structured extraction through the **Files API** (PDF upload) + **Interactions API** (`model: gemini-3.5-flash-lite` with `generation_config: { thinking_level: "low" }`, Interactions API revision `2026-05-20`, per `src/lib/ai/provider.ts`), plain `fetch` adapter.
 - Every interaction uses `store: false`; the uploaded file is deleted in a `finally` block right after the generation response is consumed (with a bounded polling window while the file state is not yet ACTIVE).
 - The output schema is generated from the per-document extraction catalogs and validated strictly server-side before anything is persisted.
 - A best-effort daily request ceiling (default **40/day**, `EXTRACTION_DAILY_REQUEST_CEILING` in `src/lib/ai/request-ceiling.ts`, plus a per-instance slot reservation) protects the free tier. It is honest best-effort, not a hard global cap; provider-side 429s remain the final guard.
-- Opt-in connectivity probe: `POST /api/diagnostics/gemini` works only when `GEMINI_DIAGNOSTIC_ENABLED === "true"` (otherwise 404). Text-only, authenticated, never touches the DB or the extraction pipeline.
+- Opt-in connectivity probe: `POST /api/diagnostics/gemini` works only when `GEMINI_DIAGNOSTIC_ENABLED === "true"` (otherwise 404). Text-only, authenticated, never touches the DB or the extraction pipeline. The probe is pinned to a separate model, `gemini-3.8-flash` (`src/app/api/diagnostics/gemini/route.ts`) — it is a connectivity check only, **not** the production extraction model.
 
 > **Data policy reminder:** the extraction adapter is designed for **synthetic documents only**. Do not send real customs documents.
 
