@@ -261,21 +261,55 @@ Honest limitations (not "all risks eliminated"):
 
 ## 13. Screenshots
 
-> **Placeholders** — the screenshots listed below have not been added to the repository yet. Capture them from the running app (see [`deployment.md`](./deployment.md) for local setup), save them under `docs/screenshots/`, and replace this section.
+Captured from the running local application with the synthetic-document demo shipment `SHP-24811` ("Electronics shipment from Mumbai to Rotterdam"), signed in as the manager demo account ("Test", role chip **Documentation Manager**). The demo database was already fully worked through by capture time — the shipment is in its final `EXPORTED` state, so screenshots show the *completed* end state of every tab. For local setup, see [`deployment.md`](./deployment.md).
 
-| # | Placeholder path | Content |
-| --- | --- | --- |
-| 1 | `docs/screenshots/01-sign-in.png` | Sign-in page (`/sign-in`) |
-| 2 | `docs/screenshots/02-shipments-list.png` | Shipments list with status badges (`/shipments`) |
-| 3 | `docs/screenshots/03-shipment-overview.png` | Shipment overview, workspace status and next-step guidance |
-| 4 | `docs/screenshots/04-documents-upload.png` | Documents tab: active versions, upload / replace |
-| 5 | `docs/screenshots/05-extraction-run.png` | Extraction run controls and attempt history |
-| 6 | `docs/screenshots/06-field-review.png` | Extracted fields with confidence, review states |
-| 7 | `docs/screenshots/07-correction-dialog.png` | Field correction dialog (new value + mandatory reason) |
-| 8 | `docs/screenshots/08-discrepancies.png` | Cross-document discrepancy list with evidence |
-| 9 | `docs/screenshots/09-approval-panel.png` | Readiness rules, approval / reject decision controls |
-| 10 | `docs/screenshots/10-export-csv.png` | Export panel and downloaded CSV (`SHP-…-export-….csv`) |
-| 11 | `docs/screenshots/11-activity.png` | Activity tab: append-only audit trail |
+### 13.1 Dashboard and shipment management
+
+The **Total shipments** tile displays a live count from shipment records (**1** in the demo database). The **Pending reviews** and **Discrepancies** tiles are placeholders and are not yet connected to their respective workflows — the field-review and cross-check dashboards are not implemented (see §17); their values are not live counts.
+
+![Dashboard with live total-shipment count and clearly labelled placeholder tiles](docs/screenshots/dashboard.png)
+
+The shipments list with status filter pills (All / Draft / Processing / Review / Awaiting approval / Approved / Rejected / Exported): `SHP-24811` carries the **Exported** badge with its description and creation timestamp, plus pagination below.
+
+![Shipments list with status filter pills and an Exported badge on SHP-24811](docs/screenshots/shipments-list.png)
+
+The shipment Overview tab: description and notes, Created / Last updated / Exported stamps, a live **Workspace status** panel (3 of 3 document types, 3 of 3 extracted, 0 pending fields, 0 active discrepancies), next-step guidance, and the recent-activity feed (`EXPORT_COMPLETED`, `APPROVAL_APPROVED`, a field-value acceptance).
+
+![Shipment overview with workspace status, export stamp and recent activity](docs/screenshots/shipment-overview.png)
+
+### 13.2 Document management
+
+The Documents tab shows one **active version** per document type — Invoice `synthetic_customs_invoice_TEST-INV-001.pdf` **v2** (with a collapsed superseded-version history from the v1→v2 replacement), Packing list v1 and Bill of lading v1. Re-uploads create a new version row; the active version is replaced and superseded history is retained for traceability (§3, §7).
+
+![Documents tab with one active version per type and retained superseded history](docs/screenshots/shipment-documents.png)
+
+### 13.3 AI extraction and field review
+
+The Extraction & Review tab: a cross-document discrepancy banner ("none active", with historical resolved records collapsed), per-document extraction status (Invoice 7 fields, Packing list 8, Bill of lading 11 — all Completed), and the **Run AI extraction** control, which is gated to DRAFT/PROCESSING/REJECTED shipments (this one is EXPORTED, so it is disabled).
+
+![Extraction & Review tab with extraction status and the status-gated run control](docs/screenshots/extraction-review-overview.png)
+
+Invoice fields of the current attempt (attempt 7): 7 fields, none pending, average confidence 100% — buyer, currency (USD), invoice date, invoice number (`TEST-INV-001`), seller, total amount (12500) and total quantity (100), all **Accepted** with per-field Correct buttons, plus the "Attempt history (5)" expansion behind which earlier attempts are preserved.
+
+![Invoice fields with confidence and review states, current attempt 7](docs/screenshots/extraction-review-invoice.png)
+
+Packing-list fields of the current attempt (attempt 2): the key corrective case — **Gross weight (kg) = 3120 KG** with the original extracted value **3165 KG** struck through, a **Corrected** badge and the correction note "3120 KG · 8 Nov 2026, 16:23 UTC · reason: Synthetic test correction: verified against the Bill of Lading." All other fields (consignee, goods description, net weight 2895 KG, packing-list date/number, shipper, total packages) are Accepted.
+
+![Packing-list gross weight corrected from 3165 KG to 3120 KG with the mandatory correction reason](docs/screenshots/extraction-review-packing-correction.png)
+
+Bill-of-lading fields of the current attempt (attempt 1): 11 fields, none pending, average confidence 100% — including **Gross weight (kg) = 3120 KG (Accepted)**, which now matches the corrected packing-list value; the earlier `WEIGHT_MISMATCH` discrepancy converged to OBSOLETE once the confirmed values were equal (§9). Ports, vessel, voyage, container, shipper and consignee are all Accepted.
+
+![Bill-of-lading fields with gross weight 3120 KG matching the corrected packing list](docs/screenshots/extraction-review-bol.png)
+
+### 13.4 Approval and export
+
+The Approval & Export tab for an already-approved shipment: decision **Approved** by the manager ("Test") on 9 Nov 2026, 12:48 UTC with the frozen **evidence snapshot** (3 documents · 3 extractions), a green readiness panel ("Ready for approval" — all requirements met), the per-document attempt confirmation rows (all "Current data confirmed"), the now-disabled Approve/Reject controls (a live decision already exists), and the Export section noting the **one-shot** export stamp of 9 Nov 2026, 12:48 UTC.
+
+![Approval & Export tab with decision, evidence snapshot, readiness and one-shot export stamp](docs/screenshots/approval-export.png)
+
+The exported CSV opened in a spreadsheet application: one row per extracted field (26 rows — 7 Invoice, 8 Packing list, 11 Bill of lading) with the columns `shipment_reference, document_type, document_version, field_key, field_label, value, unit, confidence, review_status`. The corrected packing-list gross weight exports its **effective** value — **3120 KG** with review status **CORRECTED** — never the struck-through original (§8, §11).
+
+![Exported CSV with 26 field rows; the packing-list gross weight shows the effective corrected value 3120 KG](docs/screenshots/exported-csv.png)
 
 ---
 
@@ -337,6 +371,7 @@ There is **no automated test suite** in the repository (no `test` script, no tes
 ## 17. Current Limitations
 
 - **Localhost-only.** The application runs locally; there is no deployed URL yet and no Vercel deployment has been performed.
+- **Two dashboard tiles are placeholders.** The Total shipments tile displays a live count from shipment records, but the "Pending reviews" and "Discrepancies" tiles are placeholders — not yet connected to their respective workflows (field review and cross-document checks are not implemented); their values are not live counts.
 - **No demo/reviewer accounts are configured.** Sign-up always yields the Executive role; a manager account requires a database role update (until automated, see [`deployment.md`](./deployment.md)).
 - **No automated tests** (manual verification only, §16).
 - **Correction/acceptance is manager-only by design**, so executives cannot move a shipment forward without a manager account.
