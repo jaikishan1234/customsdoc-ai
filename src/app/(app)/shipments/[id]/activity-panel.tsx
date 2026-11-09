@@ -55,6 +55,45 @@ const detailString = (
 const STATE_CHANGE_NOT_APPLIED = "state_change_not_applied";
 
 /**
+ * Display labels for the invalidation trigger reason (approval service
+ * vocabulary — kept local, same pattern as the discrepancy reasons above).
+ */
+const APPROVAL_INVALIDATION_REASON_LABELS: Record<string, string> = {
+  document_replaced: "a document was replaced",
+  evidence_re_extracted: "a new extraction attempt ran",
+  field_corrected: "a field value was corrected",
+  discrepancy_open: "a discrepancy became open",
+  discrepancy_recheck_pending: "a discrepancy was set for re-check",
+  snapshot_drift: "approved evidence drifted",
+};
+
+/** Display labels for the coarse snapshot-drift codes. */
+export const SNAPSHOT_DRIFT_CODE_LABELS: Record<string, string> = {
+  document_missing: "a required document version is gone",
+  document_version_changed: "a document version changed",
+  document_checksum_changed: "a document's content changed",
+  attempt_superseded: "extraction attempts were re-run",
+  attempt_not_completed: "a current extraction attempt is not complete",
+  snapshot_malformed: "the recorded evidence snapshot is unusable",
+  approved_state_missing: "the approved state had no approval record",
+};
+
+/** Safely reads a JSON-safe string array from a details payload. */
+const detailStringArray = (details: unknown, key: string): string[] | null => {
+  if (
+    details === null ||
+    typeof details !== "object" ||
+    Array.isArray(details)
+  ) {
+    return null;
+  }
+  const value = (details as Record<string, unknown>)[key];
+  if (!Array.isArray(value)) return null;
+  const strings = value.filter((entry): entry is string => typeof entry === "string");
+  return strings.length > 0 ? strings : null;
+};
+
+/**
  * Display labels for the action an AUDIT_RECOVERED marker vouches for. A map
  * keeps the timeline readable ("field value correction") instead of printing
  * the raw action code or the referenced row's identifiers.
@@ -66,6 +105,7 @@ const RECOVERED_ACTION_LABELS: Record<string, string> = {
   [AUDIT_ACTIONS.fieldCorrected]: "field value correction",
   [AUDIT_ACTIONS.fieldAccepted]: "field value acceptance",
   [AUDIT_ACTIONS.discrepancyReevaluated]: "discrepancy re-evaluation",
+  [AUDIT_ACTIONS.approvalInvalidated]: "approval invalidation",
 };
 
 const documentTypePart = (details: unknown): string | null => {
@@ -172,6 +212,38 @@ export const describeAuditEntry = (
     }
     if (reason !== null) parts.push(`reason: ${reason}`);
     return { label: "Field value corrected", parts };
+  }
+
+  if (entry.action === AUDIT_ACTIONS.approvalInvalidated) {
+    // Strict whitelist: the trigger reason and drift codes (both mapped
+    // from the service's constant vocabulary), and the decision/shipment
+    // status transition. Unknown codes are omitted rather than printed
+    // verbatim; checksums, snapshot ids and actor ids are never rendered —
+    // the acting session lives solely on the audit row's actorId column.
+    const parts: string[] = [];
+    const reason = detailString(details, "reason");
+    const mappedReason =
+      reason !== null
+        ? APPROVAL_INVALIDATION_REASON_LABELS[reason]
+        : undefined;
+    if (mappedReason !== undefined) parts.push(`because ${mappedReason}`);
+    const statusBefore = detailString(details, "shipmentStatusBefore");
+    const statusAfter = detailString(details, "shipmentStatusAfter");
+    if (statusBefore && statusAfter && statusBefore !== statusAfter) {
+      parts.push(`shipment ${statusBefore} → ${statusAfter}`);
+    }
+    const driftCodes = detailStringArray(details, "driftCodes");
+    if (driftCodes !== null) {
+      for (const code of driftCodes) {
+        const label = SNAPSHOT_DRIFT_CODE_LABELS[code];
+        if (label !== undefined) parts.push(label);
+      }
+    }
+    const degraded = detailString(details, "stateChangeNotApplied");
+    if (degraded !== null) {
+      parts.push("audited state change did not apply");
+    }
+    return { label: "Approval invalidated", parts };
   }
 
   if (entry.action === AUDIT_ACTIONS.auditRecovered) {

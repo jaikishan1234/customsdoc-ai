@@ -110,6 +110,10 @@ import {
 } from "./document-service";
 import { runCrossCheckForShipment } from "./discrepancy-check-service";
 import {
+  invalidateApprovalsForShipment,
+  type ApprovalInvalidationOutcome,
+} from "./approval-invalidation-service";
+import {
   appendAuditLog,
   AUDIT_ACTIONS,
   AUDIT_ENTITY_TYPES,
@@ -247,7 +251,14 @@ export type ExtractionCrossCheckOutcome =
       discrepanciesCreated: number;
       discrepanciesUpdated: number;
       discrepanciesObsoleted: number;
+      /** Additive: live OPEN rows this run's check moved to RECHECK_PENDING. */
+      discrepanciesRecheckPending: number;
       auditWritesFailed: number;
+      /** Additive: live approval decisions retired by this run's check
+       * convergence (a discrepancy became OPEN / RECHECK_PENDING). */
+      approvalsInvalidated: number;
+      /** True only when one of those retirements' audit writes failed. */
+      approvalInvalidationAuditFailed: boolean;
     }
   | { status: "deferred" }
   | { status: "failed" };
@@ -274,6 +285,12 @@ export type RunExtractionResult =
        * sequential per-document loop. Its outcome is reported separately and
        * NEVER demotes completed extraction outcomes. */
       crossCheck: ExtractionCrossCheckOutcome;
+      /** Additive: when this run created (or raced) at least one attempt
+       * row, the documents' CURRENT evidence changed — the shipment's live
+       * approval decision is invalidated (approval-invalidation-service).
+       * A run whose every document outcome is `skipped` wrote nothing and
+       * reports `no_live_approval`/`not_found` at most. */
+      approvalInvalidation: ApprovalInvalidationOutcome;
     };
 
 /** Walk Drizzle/driver error `cause` chains for a unique violation. */
@@ -436,13 +453,39 @@ export async function runExtractionForShipment(
           discrepanciesCreated: crossCheckResult.summary.discrepanciesCreated,
           discrepanciesUpdated: crossCheckResult.summary.discrepanciesUpdated,
           discrepanciesObsoleted: crossCheckResult.summary.discrepanciesObsoleted,
+          discrepanciesRecheckPending:
+            crossCheckResult.summary.discrepanciesRecheckPending,
           auditWritesFailed: crossCheckResult.summary.auditWritesFailed,
+          approvalsInvalidated: crossCheckResult.summary.approvalsInvalidated,
+          approvalInvalidationAuditFailed:
+            crossCheckResult.summary.approvalInvalidationAuditFailed,
         }
       : crossCheckResult.status === "skipped_concurrent"
         ? { status: "deferred" }
         : { status: "failed" };
 
-  return { status: "started", flippedToProcessing, outcomes, crossCheck };
+  // --- 6. Evidence-change invalidation (additive, never demoting) ----------
+  // Every non-skipped per-document outcome wrote (or raced) an attempt row:
+  // the CURRENT attempt of those documents changed, so the frozen evidence a
+  // live approval decision was made on is stale. The hook is a no-op when no
+  // live decision exists; it NEVER alters the extraction/cross-check results
+  // above. (Note: an APPROVED shipment cannot start a run — the gate above —
+  // so this retires live PENDING decisions on the eligible statuses; kept
+  // generic so the same contract holds if eligibility ever widens.)
+  const attemptCreated = outcomes.some(
+    (outcome) => outcome.status !== "skipped",
+  );
+  const approvalInvalidation: ApprovalInvalidationOutcome = attemptCreated
+    ? await invalidateApprovalsForShipment(id, "evidence_re_extracted", actorId)
+    : { status: "no_evidence_change" };
+
+  return {
+    status: "started",
+    flippedToProcessing,
+    outcomes,
+    crossCheck,
+    approvalInvalidation,
+  };
 }
 
 // ---------------------------------------------------------------------------

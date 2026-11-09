@@ -19,6 +19,10 @@ import {
   getShipmentApproval,
   type ShipmentApprovalView,
 } from "@/lib/services/approval-read-service";
+import {
+  evaluateApprovalSnapshotFreshness,
+  type SnapshotFreshnessResult,
+} from "@/lib/services/approval-invalidation-service";
 import type {
   ExtractionDocumentView,
   ShipmentExtractionHistoryResult,
@@ -190,12 +194,20 @@ export default async function ShipmentDetailPage({
   let approvalReadiness: ShipmentReadinessResult | null = null;
   let approvalView: ShipmentApprovalView | null = null;
   let approvalUnavailable = false;
+  // Additive defensive surface: the frozen snapshot of a live decision is
+  // compared against the CURRENT database state; a drifted-but-still-live
+  // decision surfaces a stale-evidence warning (the invalidation flow itself
+  // runs on write events, so this only shows when a retirement was blocked).
+  let approvalSnapshotFreshness: SnapshotFreshnessResult | null = null;
   if (activeTab === "approval") {
-    const [readinessResult, approvalResult] = await Promise.all([
-      evaluateShipmentReadiness(id),
-      getShipmentApproval(id),
-    ]);
+    const [readinessResult, approvalResult, freshnessResult] =
+      await Promise.all([
+        evaluateShipmentReadiness(id),
+        getShipmentApproval(id),
+        evaluateApprovalSnapshotFreshness(id),
+      ]);
     approvalReadiness = readinessResult;
+    approvalSnapshotFreshness = freshnessResult;
     if (approvalResult.status === "success") {
       approvalView = approvalResult.approval;
     } else if (approvalResult.status === "unavailable") {
@@ -403,6 +415,7 @@ export default async function ShipmentDetailPage({
           readiness={approvalReadiness}
           approval={approvalView}
           approvalUnavailable={approvalUnavailable}
+          snapshotFreshness={approvalSnapshotFreshness}
           documentEntries={documentEntries}
           documentsUnavailable={documentsUnavailable}
           history={extractionHistory}

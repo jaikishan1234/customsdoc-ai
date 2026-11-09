@@ -58,6 +58,10 @@ import {
   type DocumentExtractionOutcome,
   type RunExtractionResult,
 } from "@/lib/services/extraction-service";
+import {
+  summarizeApprovalInvalidation,
+  type ApprovalInvalidationSummary,
+} from "@/lib/services/approval-invalidation-service";
 import { getSession, hasRole } from "@/lib/server/auth";
 
 const UUID_PATTERN =
@@ -137,11 +141,22 @@ export interface ExtractRunSuccessBody {
         discrepanciesCreated: number;
         discrepanciesUpdated: number;
         discrepanciesObsoleted: number;
+        /** Additive: live OPEN rows moved to RECHECK_PENDING by the check. */
+        discrepanciesRecheckPending: number;
         /** > 0 means evidence snapshots need manual audit backfill. */
         auditWritesFailed: number;
+        /** Additive: approvals this run's check retired (became OPEN or
+         * RECHECK_PENDING discrepancy); normally 0 or 1. */
+        approvalsInvalidated: number;
+        /** True only when one of those retirements' audit writes failed. */
+        approvalInvalidationAuditFailed: boolean;
       }
     | { status: "deferred" }
     | { status: "failed" };
+  /** Additive: the outcome of retiring the shipment's live approval decision
+   * after this run changed (or raced) current extraction evidence. A run
+   * whose every document outcome was skipped reports "no_evidence_change". */
+  approvalInvalidation: ApprovalInvalidationSummary;
 }
 
 /** Every failure body: one client-safe `error` string and nothing else. */
@@ -373,6 +388,22 @@ export async function POST(
       return mapRunResult(result);
     }
     const auditGaps = summarizeAuditGaps(result.outcomes, result.crossCheck);
+    const approvalInvalidation = summarizeApprovalInvalidation(
+      result.approvalInvalidation,
+    );
+    // Additive partial-success reporting: the invalidation may apply while
+    // its own audit write failed — those gaps are disclosed like the others.
+    const invalidationWarnings: string[] = [];
+    if (approvalInvalidation.auditWriteFailed) {
+      invalidationWarnings.push(
+        "The shipment's approval decision was invalidated, but its audit entry could not be written and needs backfilling.",
+      );
+    }
+    if (result.crossCheck.status === "applied" && result.crossCheck.approvalInvalidationAuditFailed) {
+      invalidationWarnings.push(
+        "The discrepancy re-evaluation invalidated the shipment's approval decision, but its audit entry could not be written and needs backfilling.",
+      );
+    }
     return Response.json(
       {
         status: "started" as const,
@@ -380,8 +411,10 @@ export async function POST(
         summary: summarize(result.outcomes),
         documents: result.outcomes.map(projectOutcome),
         crossCheck: result.crossCheck,
-        auditMissing: auditGaps.auditMissing,
-        warnings: auditGaps.warnings,
+        approvalInvalidation,
+        auditMissing:
+          auditGaps.auditMissing || invalidationWarnings.length > 0,
+        warnings: [...auditGaps.warnings, ...invalidationWarnings],
       } satisfies ExtractRunSuccessBody,
       { status: 200 },
     );

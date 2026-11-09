@@ -36,6 +36,10 @@ import {
   type CorrectionBlocker,
   type CorrectFieldOutcome,
 } from "@/lib/services/correction-service";
+import {
+  summarizeApprovalInvalidation,
+  type ApprovalInvalidationSummary,
+} from "@/lib/services/approval-invalidation-service";
 import { getSession, hasRole } from "@/lib/server/auth";
 
 const UUID_PATTERN =
@@ -61,6 +65,11 @@ export interface CorrectionCrossCheckBody {
   discrepanciesRecheckPending?: number;
   /** > 0: an audit write inside the re-evaluation needs manual backfill. */
   auditWritesFailed?: number;
+  /** Additive: approvals the re-evaluation retired (a discrepancy became
+   * OPEN or RECHECK_PENDING); normally 0 or 1. */
+  approvalsInvalidated?: number;
+  /** True only when one of those retirements' audit writes failed. */
+  approvalInvalidationAuditFailed?: boolean;
 }
 
 /** The `corrected` (200) body. */
@@ -72,6 +81,9 @@ export interface CorrectionSuccessBody {
   /** True: the FIELD_CORRECTED audit write failed — manual backfill needed. */
   auditWriteFailed: boolean;
   crossCheck: CorrectionCrossCheckBody;
+  /** Additive: the correction changed the evidence a live approval decision
+   * was frozen on, so that decision was invalidated (or none was live). */
+  approvalInvalidation: ApprovalInvalidationSummary;
   /** True when any audit write for this correction needs backfilling. */
   auditMissing: boolean;
   /** Client-safe warnings for partial-success states (empty when none). */
@@ -187,8 +199,14 @@ export async function POST(
           discrepanciesRecheckPending:
             crossCheck.summary.discrepanciesRecheckPending,
           auditWritesFailed: crossCheck.summary.auditWritesFailed,
+          approvalsInvalidated: crossCheck.summary.approvalsInvalidated,
+          approvalInvalidationAuditFailed:
+            crossCheck.summary.approvalInvalidationAuditFailed,
         }
       : crossCheck;
+  const approvalInvalidation = summarizeApprovalInvalidation(
+    result.approvalInvalidation,
+  );
 
   // Additive, machine-readable audit gap reporting: the business result stays
   // successful, but the response never implies the trail is complete.
@@ -207,6 +225,11 @@ export async function POST(
       `The discrepancy re-evaluation finished, but ${crossCheckAuditFailures} audit ${crossCheckAuditFailures === 1 ? "entry" : "entries"} could not be written and ${crossCheckAuditFailures === 1 ? "needs" : "need"} backfilling.`,
     );
   }
+  if (approvalInvalidation.auditWriteFailed) {
+    auditWarnings.push(
+      "The shipment's approval decision was invalidated because of this correction, but its audit entry could not be written and needs backfilling.",
+    );
+  }
 
   return Response.json(
     {
@@ -215,6 +238,7 @@ export async function POST(
       reviewStatus: "CORRECTED" as const,
       auditWriteFailed: result.auditWriteFailed,
       crossCheck: crossCheckBody,
+      approvalInvalidation,
       auditMissing: auditWarnings.length > 0,
       warnings: auditWarnings,
     } satisfies CorrectionSuccessBody,

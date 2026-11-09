@@ -30,6 +30,9 @@ import type {
 import type {
   ShipmentApprovalView,
 } from "@/lib/services/approval-read-service";
+import type {
+  SnapshotFreshnessResult,
+} from "@/lib/services/approval-invalidation-service";
 import type { ShipmentDocumentEntry } from "@/lib/services/document-service";
 import type {
   ShipmentExtractionHistoryResult,
@@ -37,6 +40,7 @@ import type {
 
 import { ApprovalDecisionControls } from "./approval-decision-controls";
 import { REQUIRED_DOCUMENT_TYPES } from "./documents-panel";
+import { SNAPSHOT_DRIFT_CODE_LABELS } from "./activity-panel";
 
 const panelClasses =
   "flex flex-col gap-4 rounded-2xl border border-zinc-200 bg-white p-6 shadow-sm dark:border-zinc-800 dark:bg-zinc-950";
@@ -116,6 +120,7 @@ export function ApprovalPanel({
   readiness,
   approval,
   approvalUnavailable,
+  snapshotFreshness,
   documentEntries,
   documentsUnavailable,
   history,
@@ -126,6 +131,10 @@ export function ApprovalPanel({
   readiness: ShipmentReadinessResult | null;
   approval: ShipmentApprovalView | null;
   approvalUnavailable: boolean;
+  /** Additive defensive check: the live decision's frozen snapshot compared
+   * against the current documents/attempts (drift codes only, never values):
+   * an APPROVED/ PENDING decision whose evidence drifted shows a warning. */
+  snapshotFreshness: SnapshotFreshnessResult | null;
   documentEntries: readonly ShipmentDocumentEntry[];
   documentsUnavailable: boolean;
   history: ShipmentExtractionHistoryResult;
@@ -159,6 +168,26 @@ export function ApprovalPanel({
 
   const liveDecision =
     approval?.status === "PENDING" || approval?.status === "APPROVED";
+
+  // Additive staleness notice: the decision is LIVE while its frozen snapshot
+  // no longer matches the current evidence. The invalidation flow retires a
+  // live decision on every evidence event — so a drifted-but-live decision
+  // means that retirement was blocked (e.g. its audit write failed) and this
+  // panel says so instead of silently presenting stale approval.
+  const stalenessNotice = ((): string | null => {
+    if (!liveDecision) return null;
+    if (snapshotFreshness?.status === "unavailable") {
+      return "The fresh-evidence check could not run right now, so the decision's captured evidence could not be re-verified. Refresh to retry.";
+    }
+    if (snapshotFreshness?.status === "evaluated" && !snapshotFreshness.fresh) {
+      const reasons = snapshotFreshness.driftCodes
+        .map((code) => SNAPSHOT_DRIFT_CODE_LABELS[code] ?? null)
+        .filter((label): label is string => label !== null)
+        .join(", ");
+      return `The evidence behind this decision changed after it was captured${reasons ? ` (${reasons})` : ""}. The decision is stale and should be invalidated — the system retires it automatically on the next evidence event; check the Activity tab for the invalidation entry.`;
+    }
+    return null;
+  })();
 
   const approveDisabledReason = ((): string | null => {
     if (liveDecision) return "a live approval decision already exists.";
@@ -265,6 +294,15 @@ export function ApprovalPanel({
           <p className="rounded-lg border border-emerald-200 bg-emerald-50 p-2 text-xs text-emerald-800 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-200">
             This shipment is approved. CSV export is not available yet — it
             will be added in a later stage.
+          </p>
+        ) : null}
+
+        {stalenessNotice ? (
+          <p
+            role="alert"
+            className="rounded-lg border border-amber-200 bg-amber-50 p-2 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-200"
+          >
+            {stalenessNotice}
           </p>
         ) : null}
       </section>

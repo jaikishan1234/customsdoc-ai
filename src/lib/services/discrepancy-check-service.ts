@@ -84,6 +84,12 @@ import {
   getActiveDocumentsForExtraction,
   type DocumentEntryType,
 } from "./document-service";
+import {
+  countInvalidations,
+  invalidateApprovalsForShipment,
+  invalidationAuditFailed,
+  type ApprovalInvalidationOutcome,
+} from "./approval-invalidation-service";
 
 // ---------------------------------------------------------------------------
 // Confirmed business constants (single points of change)
@@ -118,6 +124,17 @@ export interface CrossCheckSummary {
   /** Live rows moved OPEN -> RECHECK_PENDING because the evidence could not
    * be verified this run (kept alive, NOT assumed gone). */
   discrepanciesRecheckPending: number;
+  /**
+   * Additive (approval invalidation stage): live approval decisions retired
+   * by this run's OWN convergence — a discrepancy created or (re-)confirmed
+   * into OPEN invalidates (reason "discrepancy_open"); OPEN rows moved to
+   * RECHECK_PENDING invalidate (reason "discrepancy_recheck_pending").
+   * Normally 0 or 1 (`approvals_live_uq` keeps at most one live row).
+   */
+  approvalsInvalidated: number;
+  /** True only when one of those invalidations' own audit write failed and
+   * needs manual backfill (the retirement itself still applied). */
+  approvalInvalidationAuditFailed: boolean;
   /**
    * Audit writes that FAILED (manual backfill needed — the DB change itself
    * still applied). A run is a CLEAN success only when this is 0; when a
@@ -274,6 +291,8 @@ const noChangeBase = (comparedPairFound: boolean): CrossCheckSummary => ({
   discrepanciesUpdated: 0,
   discrepanciesObsoleted: 0,
   discrepanciesRecheckPending: 0,
+  approvalsInvalidated: 0,
+  approvalInvalidationAuditFailed: false,
   auditWritesFailed: 0,
 });
 
@@ -465,6 +484,14 @@ const evaluateShipment = async (
       `corrections applied).`;
 
     const outcome = await convergeMismatch(id, actorId, evidence, title, detail);
+    // Additive invalidation hook: a discrepancy created or (re-)confirmed
+    // into OPEN is a blocking evidence state — the shipment's live approval
+    // decision is retired (no-op when none is live). Rows that were already
+    // OPEN with unchanged evidence become nothing new — no hook, no churn.
+    const becameOpen = outcome.created > 0 || outcome.updated > 0;
+    const invalidation: ApprovalInvalidationOutcome | null = becameOpen
+      ? await invalidateApprovalsForShipment(id, "discrepancy_open", actorId)
+      : null;
     return {
       status: "applied",
       summary: {
@@ -475,6 +502,10 @@ const evaluateShipment = async (
         discrepanciesObsoleted: outcome.obsoleted,
         discrepanciesRecheckPending: 0,
         auditWritesFailed: outcome.auditWritesFailed,
+        approvalsInvalidated: invalidation ? countInvalidations(invalidation) : 0,
+        approvalInvalidationAuditFailed: invalidation
+          ? invalidationAuditFailed(invalidation)
+          : false,
       },
     };
   }
@@ -995,6 +1026,18 @@ const deferUnverifiedEvidence = async (
     }
   }
 
+  // Additive invalidation hook: rows that BECAME RECHECK_PENDING changed the
+  // shipment's blocking state — a live approval decision is retired. Rows
+  // already in RECHECK_PENDING are left untouched (no audit churn, no hook).
+  const invalidation: ApprovalInvalidationOutcome | null =
+    recheckPending > 0
+      ? await invalidateApprovalsForShipment(
+          shipmentId,
+          "discrepancy_recheck_pending",
+          actorId,
+        )
+      : null;
+
   return {
     status: "applied",
     summary: {
@@ -1002,6 +1045,10 @@ const deferUnverifiedEvidence = async (
       discrepanciesObsoleted: 0,
       discrepanciesRecheckPending: recheckPending,
       auditWritesFailed,
+      approvalsInvalidated: invalidation ? countInvalidations(invalidation) : 0,
+      approvalInvalidationAuditFailed: invalidation
+        ? invalidationAuditFailed(invalidation)
+        : false,
     },
   };
 };

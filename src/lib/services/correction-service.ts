@@ -40,8 +40,11 @@ import "server-only";
  * Deliberate deviations from the schema header's ordering (documented, not
  * silent): instead of blindly moving live discrepancies to RECHECK_PENDING,
  * the full cross-check runs and converges to the CORRECT state for the new
- * evidence; approval invalidation (schema D5) is future work — no approval
- * service exists yet. Both resume when those features land.
+ * evidence. Approval invalidation (schema D5) is handled after step 8 via
+ * approval-invalidation-service: a correction always invalidates the
+ * shipment's live approval decision (reason "field_corrected"), audited
+ * there — it never resolves/waives discrepancies directly and never touches
+ * approvals beyond triggering that sanctioned invalidation path.
  *
  * Failure policy: neon-http has no interactive transactions, so the write is
  * a small sequence with the same partial-success discipline as the
@@ -77,6 +80,10 @@ import {
   runCrossCheckForShipment,
   type CrossCheckRunOutcome,
 } from "./discrepancy-check-service";
+import {
+  invalidateApprovalsForShipment,
+  type ApprovalInvalidationOutcome,
+} from "./approval-invalidation-service";
 
 // ---------------------------------------------------------------------------
 // Validation constants (mirroring response-validation.ts exactly)
@@ -115,6 +122,10 @@ export type CorrectFieldOutcome =
       auditWriteFailed: boolean;
       /** The immediate post-correction discrepancy re-evaluation outcome. */
       crossCheck: CrossCheckRunOutcome;
+      /** Additive: the correction changed the evidence a live approval
+       * decision was frozen on, so that decision is invalidated (the raw
+       * service contract; the route projects the client-safe fields). */
+      approvalInvalidation: ApprovalInvalidationOutcome;
     }
   /** Shipment or field id malformed / not found under the shipment. */
   | { status: "not_found" }
@@ -493,10 +504,22 @@ export async function correctExtractedField(
   // RESOLVED/WAIVED blind spot) are the check service's alone. ---------------
   const crossCheck = await runCrossCheckForShipment(sid, actorId);
 
+  // --- 9. Approval invalidation (additive, never demoting) ------------------
+  // A correction is by definition a change to the evidence a live approval
+  // decision was frozen on ("after successful field correction"). The
+  // cross-check above may already have invalidated it via its OPEN /
+  // RECHECK_PENDING hooks — that second call is then a plain no-op.
+  const approvalInvalidation = await invalidateApprovalsForShipment(
+    sid,
+    "field_corrected",
+    actorId,
+  );
+
   return {
     status: "success",
     correctionId,
     auditWriteFailed,
     crossCheck,
+    approvalInvalidation,
   };
 }

@@ -17,6 +17,11 @@ import "server-only";
  * - E: uploads to EXPORTED shipments are blocked (REJECTED is allowed).
  * - F: DOCUMENT_UPLOAD audit details carry reference, documentType, version,
  *   checksumSha256, storageKey and replacedVersionId (when replacing).
+ * - G: a persisted upload (or an S1-committed/S2-failed replacement that
+ *   removed the type's active version) is an EVIDENCE CHANGE: the shipment's
+ *   live approval decision is invalidated via approval-invalidation-service
+ *   (which audits APPROVAL_INVALIDATED). The invalidation outcome is carried
+ *   additively on the result and never demotes the upload itself.
  *
  * Concurrency — deterministic replacement in TWO sequential statements
  * (neon-http: each statement is its own implicit transaction; there are no
@@ -73,6 +78,10 @@ import {
   type DocumentTypeValue,
   type DocumentValidationError,
 } from "@/lib/validation/document";
+import {
+  invalidateApprovalsForShipment,
+  type ApprovalInvalidationOutcome,
+} from "@/lib/services/approval-invalidation-service";
 
 /** Postgres unique-violation SQLSTATE + the constraints it maps to here. */
 const PG_UNIQUE_VIOLATION = "23505";
@@ -90,12 +99,17 @@ export type UploadDocumentResult =
       status: "uploaded";
       document: ShipmentDocument;
       replacedVersionId: string | null;
+      /** Additive: the post-upload approval-invalidation outcome (raw
+       * service contract; routes project the client-safe fields). */
+      approvalInvalidation: ApprovalInvalidationOutcome;
     }
   | {
       /** Document persisted but the audit row could not be written. */
       status: "uploaded_audit_failed";
       document: ShipmentDocument;
       replacedVersionId: string | null;
+      /** Additive: the post-upload approval-invalidation outcome. */
+      approvalInvalidation: ApprovalInvalidationOutcome;
     }
   | { status: "unauthenticated" }
   | { status: "forbidden" }
@@ -112,6 +126,10 @@ export type UploadDocumentResult =
        * reconciliation (decision D) and recovery is a fresh upload. */
       status: "replacement_incomplete";
       replacedVersionId: string;
+      /** Additive: the evidence set DID change (an active version vanished),
+       * so approvals of an APPROVED shipment are defensively invalidated
+       * here too — the same invalidation task, reported separately. */
+      approvalInvalidation: ApprovalInvalidationOutcome;
     }
   | { status: "unexpected_error" };
 
@@ -312,10 +330,28 @@ export async function uploadDocument(input: {
           `document id=${documentId} (shipmentId=${shipmentId}, ` +
           `version=${version}) — audit trail requires manual backfill.`,
       );
-      return { status: "uploaded_audit_failed", document, replacedVersionId };
+      return {
+        status: "uploaded_audit_failed",
+        document,
+        replacedVersionId,
+        approvalInvalidation: await invalidateApprovalsForShipment(
+          shipmentId,
+          "document_replaced",
+          uploaderId,
+        ),
+      };
     }
 
-    return { status: "uploaded", document, replacedVersionId };
+    return {
+      status: "uploaded",
+      document,
+      replacedVersionId,
+      approvalInvalidation: await invalidateApprovalsForShipment(
+        shipmentId,
+        "document_replaced",
+        uploaderId,
+      ),
+    };
   } catch (error) {
     const constraint = findUniqueViolationConstraint(error);
 
@@ -358,7 +394,15 @@ export async function uploadDocument(input: {
         `no active document until the next successful upload.`,
     );
     logOrphanedAsset(shipmentId, documentType, version, assetKey, checksumSha256);
-    return { status: "replacement_incomplete", replacedVersionId };
+    return {
+      status: "replacement_incomplete",
+      replacedVersionId,
+      approvalInvalidation: await invalidateApprovalsForShipment(
+        shipmentId,
+        "document_replaced",
+        uploaderId,
+      ),
+    };
   }
 }
 

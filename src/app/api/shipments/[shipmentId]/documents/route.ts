@@ -45,6 +45,10 @@
 import { USER_ROLES } from "@/lib/auth";
 import { getSession, hasRole } from "@/lib/server/auth";
 import { uploadDocument } from "@/lib/services/document-service";
+import {
+  summarizeApprovalInvalidation,
+  type ApprovalInvalidationSummary,
+} from "@/lib/services/approval-invalidation-service";
 import { DOCUMENT_MAX_SIZE_BYTES } from "@/lib/validation/document";
 
 /** Multipart framing slack on top of the per-file limit (see header). */
@@ -62,6 +66,21 @@ const UPLOAD_ROLES = [
 /** Uniform client-safe JSON error responses. */
 const jsonError = (status: number, error: string): Response =>
   Response.json({ error }, { status });
+
+/* --- Wire contract (server -> client). Type-only exports. ---------------- */
+
+/** The `uploaded` (201) body (additive fields; errors are `{ error }`). */
+export interface DocumentUploadSuccessBody {
+  status: "uploaded";
+  documentId: string;
+  /** Additive: the upload changed the shipment's evidence, so its live
+   * approval decision was retired (approval-invalidation-service). Coarse
+   * statuses/reasons/drift codes only — no checksums, no approval ids. */
+  approvalInvalidation: ApprovalInvalidationSummary;
+  auditMissing: boolean;
+  warnings: readonly string[];
+  warning?: string;
+}
 
 /** Structural File detection (independent of runtime globals/versions). */
 const isFileLike = (value: FormDataEntryValue): value is File =>
@@ -238,25 +257,40 @@ export async function POST(
           {
             status: "uploaded",
             documentId: result.document.id,
+            approvalInvalidation: summarizeApprovalInvalidation(
+              result.approvalInvalidation,
+            ),
             auditMissing: false,
             warnings: [],
-          },
+          } satisfies DocumentUploadSuccessBody,
           { status: 201 },
         );
-      case "uploaded_audit_failed":
+      case "uploaded_audit_failed": {
+        const invalidationWarnings: string[] = [];
+        const approvalInvalidation = summarizeApprovalInvalidation(
+          result.approvalInvalidation,
+        );
+        if (approvalInvalidation.auditWriteFailed) {
+          invalidationWarnings.push(
+            "The shipment's approval decision was invalidated by this upload, but its audit entry could not be written and needs backfilling.",
+          );
+        }
         return Response.json(
           {
             status: "uploaded",
             documentId: result.document.id,
+            approvalInvalidation,
             auditMissing: true,
             warnings: [
               "The document was saved, but its audit entry could not be written and needs backfilling.",
+              ...invalidationWarnings,
             ],
             warning:
               "The document was saved, but its audit entry needs backfilling.",
-          },
+          } satisfies DocumentUploadSuccessBody,
           { status: 201 },
         );
+      }
       case "replacement_incomplete": {
         // The previous version was deactivated but the replacement insert
         // failed — this shipment's document type temporarily has NO active

@@ -57,6 +57,14 @@ export const AUDIT_ACTIONS = {
   /** Additive (stage 2): a manager rejected a shipment. The mandatory note is
    * snapshotted in the event so the reason survives independently. */
   approvalRejected: "APPROVAL_REJECTED",
+  /** Additive (user-approved invalidation stage): an evidence event (document
+   * replacement, new extraction attempt, field correction, or a discrepancy
+   * becoming OPEN / RECHECK_PENDING) retired the shipment's live approval
+   * decision as INVALIDATED. The row is kept as history, never deleted; the
+   * event records the trigger reason, the decision/shipment status before and
+   * after, and coarse snapshot-drift codes (never checksums or ids). Written
+   * with a null entity id only by the approved_state_missing recovery. */
+  approvalInvalidated: "APPROVAL_INVALIDATED",
   /** Provenance marker for a recovered (backfilled) audit row. It references
    * the reconstructed row by id and never replaces, mutates or re-audits it;
    * the marker is itself an ordinary append-only row with a null (system)
