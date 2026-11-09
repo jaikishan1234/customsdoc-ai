@@ -25,7 +25,8 @@
  *   404 shipment or field not found (incl. malformed UUIDs)
  *   400 invalid value / invalid reason / unchanged value
  *   409 field not correctable (document inactive, attempt superseded or
- *      not completed)
+ *      not completed) or the shipment was already exported (exported
+ *      records are final)
  *   500 unexpected server failure
  *   503 database unavailable (correction not applied)
  */
@@ -106,6 +107,8 @@ const blockerMessage = (reason: CorrectionBlocker): string => {
       return "This field belongs to a superseded extraction attempt and can no longer be corrected. Correct the field of the document's current attempt instead.";
     case "attempt_not_completed":
       return "The current extraction attempt has not completed, so there is no confirmed value to correct yet. Run extraction first.";
+    case "shipment_exported":
+      return "This shipment has already been exported — the exported CSV is final and can no longer be corrected.";
   }
 };
 

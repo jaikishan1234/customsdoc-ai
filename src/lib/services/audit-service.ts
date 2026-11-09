@@ -65,6 +65,11 @@ export const AUDIT_ACTIONS = {
    * after, and coarse snapshot-drift codes (never checksums or ids). Written
    * with a null entity id only by the approved_state_missing recovery. */
   approvalInvalidated: "APPROVAL_INVALIDATED",
+  /** Additive (user-approved 2026-11): one successful CSV export that stamped
+   * the shipment APPROVED -> EXPORTED. The event records the row count and
+   * the exact export timestamp — never field values, checksums or snapshot
+   * payloads (the exported content itself is the export artifact). */
+  exportCompleted: "EXPORT_COMPLETED",
   /** Provenance marker for a recovered (backfilled) audit row. It references
    * the reconstructed row by id and never replaces, mutates or re-audits it;
    * the marker is itself an ordinary append-only row with a null (system)

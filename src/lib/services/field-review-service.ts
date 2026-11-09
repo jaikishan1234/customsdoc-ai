@@ -10,7 +10,8 @@ import "server-only";
  *   1. validates the shipment/field ids and loads the field with its
  *      extraction and document (explicit verification of the
  *      (field, extraction, shipment) triple);
- *   2. requires the owning document to be ACTIVE;
+ *   2. requires the owning document to be ACTIVE and the owning shipment not
+ *      yet EXPORTED (CSV export stage: exported records stay final);
  *   3. requires the field's extraction to be the document's CURRENT attempt
  *      (max(attempt) across ALL statuses — the same freshness law the
  *      correction, check and read services use) and that attempt COMPLETED;
@@ -44,7 +45,7 @@ import {
 } from "@/lib/ai/extraction-catalogs";
 
 import { db } from "@/lib/db";
-import { documents, extractedFields, extractions } from "@/lib/db/schema";
+import { documents, extractedFields, extractions, shipments } from "@/lib/db/schema";
 import {
   appendAuditLog,
   AUDIT_ACTIONS,
@@ -95,7 +96,10 @@ export type FieldAcceptBlocker =
   /** The current attempt has not completed — there is no confirmed value. */
   | "attempt_not_completed"
   /** The value was already accepted or corrected (never re-flagged here). */
-  | "already_reviewed";
+  | "already_reviewed"
+  /** Additive (CSV export stage): the shipment was already exported — the
+   * one-shot export stamp is final and reviewed states stay frozen. */
+  | "shipment_exported";
 
 // ---------------------------------------------------------------------------
 // Value validation (per catalog kind — single source of truth)
@@ -184,6 +188,14 @@ export async function acceptExtractedField(
     numericValue: string | null;
     unit: string | null;
     reviewStatus: "PENDING_REVIEW" | "ACCEPTED" | "CORRECTED";
+    shipmentStatus:
+      | "DRAFT"
+      | "PROCESSING"
+      | "REVIEW"
+      | "AWAITING_APPROVAL"
+      | "APPROVED"
+      | "REJECTED"
+      | "EXPORTED";
     documentId: string;
     documentType: "INVOICE" | "PACKING_LIST" | "BILL_OF_LADING";
     documentIsActive: boolean;
@@ -201,6 +213,7 @@ export async function acceptExtractedField(
         numericValue: extractedFields.numericValue,
         unit: extractedFields.unit,
         reviewStatus: extractedFields.reviewStatus,
+        shipmentStatus: shipments.status,
         documentId: extractions.documentId,
         documentType: documents.documentType,
         documentIsActive: documents.isActive,
@@ -208,6 +221,7 @@ export async function acceptExtractedField(
       .from(extractedFields)
       .innerJoin(extractions, eq(extractedFields.extractionId, extractions.id))
       .innerJoin(documents, eq(extractions.documentId, documents.id))
+      .innerJoin(shipments, eq(extractedFields.shipmentId, shipments.id))
       .where(
         and(eq(extractedFields.id, fid), eq(extractedFields.shipmentId, sid)),
       )
@@ -225,6 +239,11 @@ export async function acceptExtractedField(
   }
 
   // --- 2. Active document + current completed attempt ------------------------
+  // Lifecycle protection (CSV export stage): an EXPORTED shipment's accepted
+  // states are final — its exported CSV must never change after the fact.
+  if (field.shipmentStatus === "EXPORTED") {
+    return { status: "field_not_acceptable", reason: "shipment_exported" };
+  }
   if (!field.documentIsActive) {
     return { status: "field_not_acceptable", reason: "document_inactive" };
   }

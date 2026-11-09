@@ -1,5 +1,6 @@
 /**
- * Approval & Export tab content (approval phase; CSV export is not built).
+ * Approval & Export tab content (approval phase + manager-only CSV export
+ * control).
  *
  * Server-rendered presentation over the existing read paths:
  * - readiness + exact blockers: `evaluateShipmentReadiness()` (approval
@@ -39,6 +40,7 @@ import type {
 } from "@/lib/services/extraction-read-service";
 
 import { ApprovalDecisionControls } from "./approval-decision-controls";
+import { ApprovalExportControls } from "./approval-export-controls";
 import { REQUIRED_DOCUMENT_TYPES } from "./documents-panel";
 import { SNAPSHOT_DRIFT_CODE_LABELS } from "./activity-panel";
 
@@ -215,6 +217,38 @@ export function ApprovalPanel({
     return null;
   })();
 
+  // Export readiness (manager-only control; the export API independently
+  // re-verifies every rule server-side). Null = the control is enabled.
+  const exportDisabledReason = ((): string | null => {
+    if (shipment.status !== "APPROVED") {
+      return shipment.status === "EXPORTED"
+        ? "already exported — the stamp is one-shot history."
+        : "the shipment's current status does not allow export yet (APPROVED required).";
+    }
+    if (approval === null || approval.status !== "APPROVED") {
+      return "an approved decision is required.";
+    }
+    if (readiness === null || readiness.status !== "success") {
+      return "readiness could not be evaluated; refresh to retry.";
+    }
+    if (!readiness.ready) {
+      return "resolve the readiness blockers listed above first.";
+    }
+    if (
+      snapshotFreshness === null ||
+      snapshotFreshness.status === "unavailable"
+    ) {
+      return "the decision's evidence could not be re-verified right now; refresh to retry.";
+    }
+    if (
+      snapshotFreshness.status === "evaluated" &&
+      !snapshotFreshness.fresh
+    ) {
+      return "the approved evidence changed after the decision (stale) — the decision must be made again before exporting.";
+    }
+    return null;
+  })();
+
   return (
     <div className="flex flex-col gap-6">
       {/* 1. Current state + latest decision. */}
@@ -292,8 +326,8 @@ export function ApprovalPanel({
 
         {approval?.status === "APPROVED" ? (
           <p className="rounded-lg border border-emerald-200 bg-emerald-50 p-2 text-xs text-emerald-800 dark:border-emerald-900 dark:bg-emerald-950/40 dark:text-emerald-200">
-            This shipment is approved. CSV export is not available yet — it
-            will be added in a later stage.
+            This shipment is approved. Export the CSV from the Export section
+            below when you are ready — exporting is one-shot and final.
           </p>
         ) : null}
 
@@ -461,6 +495,34 @@ export function ApprovalPanel({
             Only documentation managers may approve or reject shipments. The
             decision API independently enforces this on every request.
           </p>
+        )}
+      </section>
+
+      {/* 5. Export CSV — visible to managers only (the export API
+             independently enforces the role and every rule server-side). */}
+      <section aria-label="CSV export" className={panelClasses}>
+        <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-50">
+          Export
+        </h2>
+        {!canDecide ? (
+          <p className={mutedText}>
+            Only documentation managers may export shipments. The export API
+            independently enforces this on every request.
+          </p>
+        ) : shipment.status === "EXPORTED" ? (
+          <p className={mutedText}>
+            This shipment was exported
+            {shipment.exportedAt
+              ? ` on ${formatLongDateTimeUtc(shipment.exportedAt, "UTC")}`
+              : ""}
+            . The export stamp is one-shot history — records stay final and
+            the CSV cannot be exported again.
+          </p>
+        ) : (
+          <ApprovalExportControls
+            shipmentId={shipment.id}
+            disabledReason={exportDisabledReason}
+          />
         )}
       </section>
     </div>

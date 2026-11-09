@@ -18,6 +18,9 @@ import "server-only";
  *      (`extraction-catalogs.ts` is the single source of truth for field
  *      types; numeric/integer values must fit `NUMERIC(14,4)` — validated
  *      here with the same magnitude limit `response-validation.ts` uses);
+ *      a shipment already EXPORTED is additionally rejected outright
+ *      (additive, CSV export stage — the exported CSV's effective values
+ *      must never change afterwards);
  *   4. reject a no-op: the submitted value must differ from the field's
  *      CURRENT EFFECTIVE value (latest correction first, original extraction
  *      value otherwise) — the DB CHECK `field_corrections_changes_value`
@@ -69,6 +72,7 @@ import {
   extractedFields,
   extractions,
   fieldCorrections,
+  shipments,
 } from "@/lib/db/schema";
 import {
   appendAuditLog,
@@ -144,7 +148,11 @@ export type CorrectionBlocker =
   /** The extraction is no longer the document's current attempt. */
   | "attempt_superseded"
   /** The current attempt has not completed — there is no confirmed value. */
-  | "attempt_not_completed";
+  | "attempt_not_completed"
+  /** Additive (CSV export stage): the shipment was already exported — the
+   * one-shot export stamp is final and no further corrections may change
+   * the evidence behind an exported record. */
+  | "shipment_exported";
 
 // ---------------------------------------------------------------------------
 // Value validation (per catalog kind — single source of truth)
@@ -257,6 +265,14 @@ export async function correctExtractedField(
     unit: string | null;
     confidence: string;
     reviewStatus: "PENDING_REVIEW" | "ACCEPTED" | "CORRECTED";
+    shipmentStatus:
+      | "DRAFT"
+      | "PROCESSING"
+      | "REVIEW"
+      | "AWAITING_APPROVAL"
+      | "APPROVED"
+      | "REJECTED"
+      | "EXPORTED";
     documentId: string;
     documentType: "INVOICE" | "PACKING_LIST" | "BILL_OF_LADING";
     documentVersion: number;
@@ -277,6 +293,7 @@ export async function correctExtractedField(
         unit: extractedFields.unit,
         confidence: extractedFields.confidence,
         reviewStatus: extractedFields.reviewStatus,
+        shipmentStatus: shipments.status,
         documentId: extractions.documentId,
         documentType: documents.documentType,
         documentVersion: documents.version,
@@ -286,6 +303,7 @@ export async function correctExtractedField(
       .from(extractedFields)
       .innerJoin(extractions, eq(extractedFields.extractionId, extractions.id))
       .innerJoin(documents, eq(extractions.documentId, documents.id))
+      .innerJoin(shipments, eq(extractedFields.shipmentId, shipments.id))
       .where(
         and(
           eq(extractedFields.id, fid),
@@ -307,7 +325,10 @@ export async function correctExtractedField(
 
   // --- 2. Eligibility: current attempt (max(attempt) across ALL statuses)
   // of an ACTIVE document, COMPLETED — no corrections on history --------------
+  // Lifecycle protection (CSV export stage): an EXPORTED shipment's records
+  // are finalized — the exported CSV's effective values must never change.
   const exactBlocker = ((): CorrectionBlocker | null => {
+    if (field!.shipmentStatus === "EXPORTED") return "shipment_exported";
     if (!field!.documentIsActive) return "document_inactive";
     return null;
   })();

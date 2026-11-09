@@ -25,7 +25,8 @@
  *   404 shipment or field not found (incl. malformed UUIDs)
  *   400 the stored value is missing/invalid and cannot be accepted
  *   409 not acceptable right now (document inactive, attempt superseded or
- *      not completed, or the value was already accepted/corrected)
+ *      not completed, the value was already accepted/corrected, or the
+ *      shipment was already exported — exported records are final)
  *   500 unexpected server failure
  *   503 database unavailable (acceptance not applied)
  */
@@ -85,6 +86,8 @@ const blockerMessage = (reason: FieldAcceptBlocker): string => {
       return "The current extraction attempt has not completed, so there is no confirmed value to accept yet. Run extraction first.";
     case "already_reviewed":
       return "This field has already been reviewed (accepted or corrected) and cannot be accepted again.";
+    case "shipment_exported":
+      return "This shipment has already been exported — the exported CSV is final and its fields can no longer be accepted.";
   }
 };
 
